@@ -5,22 +5,8 @@ from .visualization_utils import draw_prediction_on_image_simple, draw_predictio
 from .feedback_utils import PoseFeedback, draw_comprehensive_feedback_overlay
 
 def interpolate_keypoints(prev_kp, curr_kp, next_kp):
-    """Interpolate keypoints using previous, current, and next frames.
-    If confidence is available, use it as weights; otherwise, use simple mean."""
-    # Assume shape (..., 3): (y, x, confidence)
-    if prev_kp.shape == curr_kp.shape == next_kp.shape and prev_kp.shape[-1] == 3:
-        # Weighted average by confidence
-        prev_conf = prev_kp[..., 2]
-        curr_conf = curr_kp[..., 2]
-        next_conf = next_kp[..., 2]
-        total_conf = prev_conf + curr_conf + next_conf + 1e-6  # avoid div by zero
-        y = (prev_kp[..., 0] * prev_conf + curr_kp[..., 0] * curr_conf + next_kp[..., 0] * next_conf) / total_conf
-        x = (prev_kp[..., 1] * prev_conf + curr_kp[..., 1] * curr_conf + next_kp[..., 1] * next_conf) / total_conf
-        conf = np.maximum.reduce([prev_conf, curr_conf, next_conf])
-        return np.stack([y, x, conf], axis=-1)
-    else:
-        # Fallback: simple mean
-        return (prev_kp + curr_kp + next_kp) / 3.0
+    """Deprecated: temporal interpolation removed (no spatio-temporal smoothing)."""
+    return curr_kp
 
 
 class PoseProcessor:
@@ -31,46 +17,19 @@ class PoseProcessor:
         self.input_size = input_size
         self.feedback = PoseFeedback()
         
-        # Responsive smoothing parameters - optimized for stability without lag
+        # No temporal smoothing: use raw model outputs only
         self.prev_keypoints = None
-        self.smoothing_factor = 0.6  # Reduced for more responsiveness
-        self.confidence_threshold = 0.15  # Minimum confidence for keypoints
-        
-        # Keypoint-specific smoothing factors - balanced for responsiveness
-        self.keypoint_smoothing_factors = {
-            0: 0.7,   # nose - balanced
-            1: 0.7,   # left_eye
-            2: 0.7,   # right_eye
-            3: 0.7,   # left_ear
-            4: 0.7,   # right_ear
-            5: 0.65,  # left_shoulder - core body part
-            6: 0.65,  # right_shoulder
-            7: 0.6,   # left_elbow - arm part
-            8: 0.6,   # right_elbow
-            9: 0.55,  # left_wrist - extremity
-            10: 0.55, # right_wrist
-            11: 0.65, # left_hip - core body part
-            12: 0.65, # right_hip
-            13: 0.6,  # left_knee - leg part
-            14: 0.6,  # right_knee
-            15: 0.55, # left_ankle - extremity
-            16: 0.55  # right_ankle
-        }
     
     def get_keypoint_confidence(self, keypoints, kp_idx):
-        """Get confidence score for a keypoint, handling different formats."""
+        """Return confidence for a keypoint; kept for API compatibility."""
         try:
             if keypoints.shape[1] == 3:
-                # Format: (x, y, confidence)
                 return float(keypoints[kp_idx, 2])
             elif keypoints.shape[1] == 1:
-                # Format: (confidence) - this is likely the scores array
                 return float(keypoints[kp_idx, 0])
             else:
-                # Unknown format, assume high confidence
                 return 1.0
         except (IndexError, TypeError):
-            # If we can't access the confidence, assume it's high
             return 1.0
     
     def get_keypoint_coords(self, keypoints, kp_idx):
@@ -90,80 +49,16 @@ class PoseProcessor:
             return 0.5, 0.5
     
     def calculate_movement(self, current_kp, previous_kp):
-        """Calculate movement between current and previous keypoints."""
-        if previous_kp is None:
-            return np.zeros(current_kp.shape[0])
-        
-        # Calculate Euclidean distance for each keypoint
-        movement = np.zeros(current_kp.shape[0])
-        for i in range(current_kp.shape[0]):
-            try:
-                curr_x, curr_y = self.get_keypoint_coords(current_kp, i)
-                prev_x, prev_y = self.get_keypoint_coords(previous_kp, i)
-                movement[i] = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
-            except:
-                movement[i] = 0.0
-        
-        return movement
+        """Deprecated: movement-based smoothing removed."""
+        return np.zeros(current_kp.shape[0])
     
     def apply_responsive_smoothing(self, current_keypoints, prev_keypoints):
-        """Apply responsive smoothing that reduces jitter without causing lag."""
-        if prev_keypoints is None:
-            return current_keypoints
-        
-        smoothed_keypoints = current_keypoints.copy()
-        
-        # Calculate movement for each keypoint
-        movement = self.calculate_movement(current_keypoints, prev_keypoints)
-        
-        for i in range(current_keypoints.shape[0]):
-            try:
-                # Get confidence for this keypoint
-                confidence = self.get_keypoint_confidence(current_keypoints, i)
-                
-                # Skip if confidence is too low
-                if confidence < self.confidence_threshold:
-                    continue
-                
-                # Get keypoint-specific smoothing factor
-                base_smoothing = self.keypoint_smoothing_factors.get(i, 0.6)
-                
-                # Adaptive smoothing based on movement
-                if movement[i] < 0.01:  # Very small movement - apply more smoothing
-                    smoothing_factor = min(0.8, base_smoothing + 0.1)
-                elif movement[i] < 0.05:  # Small movement - moderate smoothing
-                    smoothing_factor = base_smoothing
-                else:  # Large movement - minimal smoothing for responsiveness
-                    smoothing_factor = max(0.3, base_smoothing - 0.2)
-                
-                # Apply smoothing - handle different keypoint formats
-                if current_keypoints.shape[1] == 3 and prev_keypoints.shape[1] == 3:
-                    # Standard format: (x, y, confidence)
-                    smoothed_keypoints[i] = (smoothing_factor * prev_keypoints[i] + 
-                                           (1 - smoothing_factor) * current_keypoints[i])
-                elif current_keypoints.shape[1] == 1 and prev_keypoints.shape[1] == 1:
-                    # Confidence scores only
-                    smoothed_keypoints[i, 0] = (smoothing_factor * prev_keypoints[i, 0] + 
-                                              (1 - smoothing_factor) * current_keypoints[i, 0])
-            except Exception as e:
-                # If smoothing fails for this keypoint, keep original
-                continue
-        
-        return smoothed_keypoints
+        """Deprecated: smoothing disabled; return current keypoints."""
+        return current_keypoints
     
     def apply_smoothing(self, current_keypoints, prev_keypoints):
-        """Apply responsive smoothing pipeline."""
-        if prev_keypoints is None:
-            return current_keypoints
-        
-        try:
-            # Apply responsive smoothing
-            smoothed_keypoints = self.apply_responsive_smoothing(current_keypoints, prev_keypoints)
-            return smoothed_keypoints
-        except Exception as e:
-            # If smoothing fails, return original keypoints
-            print(f"Warning: Smoothing failed, using original keypoints. Error: {e}")
-            return current_keypoints
+        """Deprecated: smoothing disabled; return current keypoints."""
+        return current_keypoints
     
     def process_frame(self, frame, show_feedback=True):
         """Process a single frame and return the result."""
@@ -177,12 +72,7 @@ class PoseProcessor:
         # Run MoveNet
         keypoints_with_scores = self.movenet(input_image)
 
-        # Apply responsive smoothing
-        if self.prev_keypoints is not None:
-            keypoints_with_scores = self.apply_smoothing(keypoints_with_scores, self.prev_keypoints)
-        
-        # Store current keypoints for next frame
-        self.prev_keypoints = keypoints_with_scores.copy()
+        # No temporal smoothing; use raw keypoints per frame
 
         # Get comprehensive feedback if requested
         feedback = None
@@ -232,7 +122,7 @@ class PoseProcessor:
         return output_overlay, keypoints_with_scores, feedback
 
 def process_video_with_squat_analysis(video_path, movenet_model, input_size, output_path=None):
-    """Process video with comprehensive squat form analysis - optimized for mobile, with temporal interpolation."""
+    """Process video with comprehensive squat form analysis - no temporal interpolation."""
     processor = PoseProcessor(movenet_model, input_size)
     
     # Open video with FFMPEG backend and disable automatic rotation
@@ -304,11 +194,23 @@ def process_video_with_squat_analysis(video_path, movenet_model, input_size, out
     print("- Preserves original video orientation")
     print("- Green: Good form | Orange: Needs improvement | Red: Form issues")
     
+    # Determine processing cadence: process at input fps up to a maximum of 60 fps
+    # If fps is unavailable, assume 30
+    try:
+        import math
+        max_fps = 60
+        input_fps = fps if fps and fps > 0 else 30
+        process_step = max(1, int(math.ceil(input_fps / max_fps)))
+        effective_output_fps = max(1, int(round(input_fps / process_step)))
+    except Exception:
+        process_step = 1
+        effective_output_fps = fps if fps and fps > 0 else 30
+
     # Setup video writer if output path is provided
     writer = None
     if output_path:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
+        writer = cv2.VideoWriter(output_path, fourcc, effective_output_fps, (out_w, out_h))
         print(f"Output will be saved to: {output_path}")
     
     frame_count = 0
@@ -344,7 +246,15 @@ def process_video_with_squat_analysis(video_path, movenet_model, input_size, out
                     rotated_h, rotated_w = pose_detection_frame.shape[:2]
                     print(f"After counter-rotation: {rotated_w}x{rotated_h}")
             
-            # Process frame for pose detection - real-time processing without buffering
+            # Skip frames to cap processing rate to <= 60 FPS
+            if (frame_count - 1) % process_step != 0:
+                # Even if skipping processing, still allow early quit
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("Processing stopped by user.")
+                    break
+                continue
+
+            # Process frame for pose detection - real-time processing
             output_overlay, keypoints_with_scores, feedback = processor.process_frame(pose_detection_frame, show_feedback=True)
             
             # Apply counter-rotation to output if needed
@@ -393,7 +303,7 @@ def process_video_with_squat_analysis(video_path, movenet_model, input_size, out
         print("Video processing completed!")
 
 def process_webcam_with_squat_analysis(movenet_model, input_size):
-    """Process webcam feed with comprehensive squat form analysis - optimized for mobile."""
+    """Process webcam feed with comprehensive squat form analysis - no temporal interpolation."""
     processor = PoseProcessor(movenet_model, input_size)
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -418,10 +328,7 @@ def process_webcam_with_squat_analysis(movenet_model, input_size):
     print("- 720p resolution for mobile performance")
     print("Press 'q' to quit.")
 
-    buffer_size = 5 # must be odd
-    frame_buffer = []
-    keypoints_buffer = []
-    feedback_buffer = []
+    # No buffering for temporal interpolation
 
     try:
         while True:
@@ -430,37 +337,10 @@ def process_webcam_with_squat_analysis(movenet_model, input_size):
                 print("Failed to grab frame")
                 break
 
-            # Process frame (get keypoints, but don't display yet)
-            _, keypoints_with_scores, feedback = processor.process_frame(frame, show_feedback=True)
-            frame_buffer.append(frame)
-            keypoints_buffer.append(keypoints_with_scores)
-            feedback_buffer.append(feedback)
-
-            if len(frame_buffer) == buffer_size:
-                center_idx = buffer_size // 2
-
-                # Interpolate keypoints for the center frame
-                prev_kp = keypoints_buffer[center_idx - 1]
-                curr_kp = keypoints_buffer[center_idx]
-                next_kp = keypoints_buffer[center_idx + 1]
-
-                # You need to implement this function:
-                smoothed_kp = interpolate_keypoints(prev_kp, curr_kp, next_kp)
-
-                # Draw overlay for the center frame using smoothed keypoints
-                output_overlay, _, _ = processor.process_frame(
-                    frame_buffer[center_idx], show_feedback=True
-                )
-                # Optionally, replace keypoints in output_overlay with smoothed_kp
-
-                # Display with adaptive window sizing
-                cv2.namedWindow('MoveNet Lightning - Squat Analysis', cv2.WINDOW_NORMAL)
-                cv2.imshow('MoveNet Lightning - Squat Analysis', output_overlay)
-
-                # Remove oldest frame/keypoints/feedback
-                frame_buffer.pop(0)
-                keypoints_buffer.pop(0)
-                feedback_buffer.pop(0)
+            # Process and display each frame directly
+            output_overlay, _, _ = processor.process_frame(frame, show_feedback=True)
+            cv2.namedWindow('MoveNet Lightning - Squat Analysis', cv2.WINDOW_NORMAL)
+            cv2.imshow('MoveNet Lightning - Squat Analysis', output_overlay)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break

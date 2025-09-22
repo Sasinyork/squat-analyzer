@@ -256,7 +256,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     
     # Position overlay with margin from bottom and sides
     margin = 5  # Reduced margin to give more space
-    side_margin = min(200, width // 8)  # Much smaller side margins for wider feedback background
+    side_margin = min(200, width // 10)  # Much smaller side margins for wider feedback background
     bg_y_start = height - text_bg_height - margin
     
     # Ensure valid rectangle coordinates
@@ -272,7 +272,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         
         # Draw main feedback message
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.8  # Increased font size for better visibility
+        font_scale = 1.1  # Increased font size for better visibility
         thickness = 3
         
         # Main message - adjust for narrower width
@@ -291,7 +291,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 # Truncate if too long
                 if len(depth_text) > 45:  # Reduced from 50 for mobile
                     depth_text = depth_text[:42] + "..."
-                depth_size = cv2.getTextSize(depth_text, font, 0.7, 2)[0]  # Increased font size
+                depth_size = cv2.getTextSize(depth_text, font, 0.9, 2)[0]  # Increased font size
                 depth_x = ((width - side_margin * 2) - depth_size[0]) // 2 + side_margin
                 depth_y = bg_y_start + 45
                 
@@ -303,7 +303,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 else:
                     depth_color = (255, 255, 255)  # White for other statuses
                 
-                cv2.putText(image, depth_text, (depth_x, depth_y), font, 0.7, depth_color, 2)
+                cv2.putText(image, depth_text, (depth_x, depth_y), font, 0.9, depth_color, 2)
                 
                 # Show recommendation below depth message if available
                 if form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0:
@@ -331,15 +331,48 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                         lines = [recommendation_text]
                     
                     # Draw each line
-                    line_height = 20  # Increased space between lines
+                    line_height = 24  # Increased space between lines for larger font
                     for i, line in enumerate(lines):
-                        line_size = cv2.getTextSize(line, font, 0.6, 2)[0]  # Increased font size
+                        line_size = cv2.getTextSize(line, font, 0.75, 2)[0]  # Increased font size
                         line_x = ((width - side_margin * 2) - line_size[0]) // 2 + side_margin
                         line_y = bg_y_start + 65 + (i * line_height)  # Below depth message, with spacing
                         
                         # Use a different color for recommendations (cyan)
                         recommendation_color = (255, 255, 0)  # Cyan for recommendations
-                        cv2.putText(image, line, (line_x, line_y), font, 0.6, recommendation_color, 2)
+                        cv2.putText(image, line, (line_x, line_y), font, 0.75, recommendation_color, 2)
+            
+            # Add good/bad form indicator inside the feedback box at the bottom
+            depth_status = form_analysis.get('depth_status')
+            if depth_status in ['good', 'needs_improvement']:
+                is_good = depth_status == 'good'
+                pill_color = (0, 255, 0) if is_good else (255, 0, 0)
+                label = 'GOOD FORM' if is_good else 'INCORRECT FORM'
+
+                # Compute pill dimensions based on text size
+                pill_font = cv2.FONT_HERSHEY_SIMPLEX
+                pill_scale = 0.85
+                pill_thickness = 2
+                text_size = cv2.getTextSize(label, pill_font, pill_scale, pill_thickness)[0]
+                horizontal_padding = 18
+                vertical_padding = 6
+                pill_width = text_size[0] + horizontal_padding * 2
+                pill_height = text_size[1] + vertical_padding * 2
+
+                # Position centered at bottom of the overlay box with small margin
+                available_width = x2 - x1
+                pill_x1 = x1 + max(10, (available_width - pill_width) // 2)
+                pill_x2 = pill_x1 + pill_width
+                pill_y2 = y2 - 8
+                pill_y1 = pill_y2 - pill_height
+
+                # Draw rounded pill
+                image = draw_rounded_rectangle_with_alpha(image, pill_x1, pill_y1, pill_x2, pill_y2, pill_color, alpha=0.9, radius=10)
+
+                # Draw label centered in pill
+                text_x = pill_x1 + (pill_width - text_size[0]) // 2
+                text_y = pill_y1 + (pill_height + text_size[1]) // 2
+                text_color = (0, 0, 0) if is_good else (255, 255, 255)
+                cv2.putText(image, label, (text_x, text_y), pill_font, pill_scale, text_color, pill_thickness)
     
     return image
 

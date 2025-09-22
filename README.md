@@ -17,7 +17,6 @@ A powerful real-time pose detection and squat form analysis application using Go
 - **Real-time Webcam Processing**: Live pose detection with form analysis
 - **Video File Processing**: Analyze pre-recorded videos with comprehensive feedback
 - **Enhanced Keypoint Visualization**: Improved skeleton rendering with color-coded body parts
-- **Temporal Smoothing**: Reduces jitter and improves tracking stability
 - **Adaptive Thresholds**: Different sensitivity levels for different body parts
 
 ### User Interface Improvements
