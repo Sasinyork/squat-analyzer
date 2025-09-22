@@ -226,15 +226,15 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     """Draw comprehensive feedback on the image with mobile-optimized layout."""
     height, width, _ = image.shape
     
-    # Calculate adaptive background height based on content - reduced for mobile
-    base_height = 60  # Reduced since we removed phase and simplified feedback
+    # Calculate adaptive background height based on content - increased for larger text
+    base_height = 100  # Increased to accommodate larger text
     extra_height = 0
     
     # Add extra height for form analysis
     if feedback.get('form_analysis'):
         form_analysis = feedback['form_analysis']
         if form_analysis.get('depth_message') and form_analysis.get('depth_status'):
-            extra_height += 15  # Reduced since we have less content
+            extra_height += 25  # Increased for larger text
         # Add extra height for recommendations
         if form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0:
             recommendation_text = form_analysis['recommendations'][0]
@@ -250,13 +250,13 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     text_bg_height = base_height + extra_height
     
     # Ensure we don't exceed image bounds and leave some margin
-    max_height = min(height * 0.25, 140)  # Reduced max height for mobile
+    max_height = min(height * 0.3, 180)  # Increased max height for larger text
     if text_bg_height > max_height:
         text_bg_height = int(max_height)
     
     # Position overlay with margin from bottom and sides
     margin = 5  # Reduced margin to give more space
-    side_margin = min(600, width // 4)  # Reduced side margin to give more space for text
+    side_margin = min(200, width // 8)  # Much smaller side margins for wider feedback background
     bg_y_start = height - text_bg_height - margin
     
     # Ensure valid rectangle coordinates
@@ -272,8 +272,8 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         
         # Draw main feedback message
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5  # Slightly smaller for mobile
-        thickness = 2
+        font_scale = 0.8  # Increased font size for better visibility
+        thickness = 3
         
         # Main message - adjust for narrower width
         text_size = cv2.getTextSize(feedback['message'], font, font_scale, thickness)[0]
@@ -291,7 +291,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 # Truncate if too long
                 if len(depth_text) > 45:  # Reduced from 50 for mobile
                     depth_text = depth_text[:42] + "..."
-                depth_size = cv2.getTextSize(depth_text, font, 0.5, 1)[0]  # Smaller font
+                depth_size = cv2.getTextSize(depth_text, font, 0.7, 2)[0]  # Increased font size
                 depth_x = ((width - side_margin * 2) - depth_size[0]) // 2 + side_margin
                 depth_y = bg_y_start + 45
                 
@@ -303,7 +303,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 else:
                     depth_color = (255, 255, 255)  # White for other statuses
                 
-                cv2.putText(image, depth_text, (depth_x, depth_y), font, 0.5, depth_color, 1)
+                cv2.putText(image, depth_text, (depth_x, depth_y), font, 0.7, depth_color, 2)
                 
                 # Show recommendation below depth message if available
                 if form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0:
@@ -331,15 +331,15 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                         lines = [recommendation_text]
                     
                     # Draw each line
-                    line_height = 15  # Space between lines
+                    line_height = 20  # Increased space between lines
                     for i, line in enumerate(lines):
-                        line_size = cv2.getTextSize(line, font, 0.4, 1)[0]
+                        line_size = cv2.getTextSize(line, font, 0.6, 2)[0]  # Increased font size
                         line_x = ((width - side_margin * 2) - line_size[0]) // 2 + side_margin
                         line_y = bg_y_start + 65 + (i * line_height)  # Below depth message, with spacing
                         
                         # Use a different color for recommendations (cyan)
                         recommendation_color = (255, 255, 0)  # Cyan for recommendations
-                        cv2.putText(image, line, (line_x, line_y), font, 0.4, recommendation_color, 1)
+                        cv2.putText(image, line, (line_x, line_y), font, 0.6, recommendation_color, 2)
     
     return image
 

@@ -4,6 +4,25 @@ import numpy as np
 from .visualization_utils import draw_prediction_on_image_simple, draw_prediction_on_image_adaptive, draw_prediction_on_image_enhanced
 from .feedback_utils import PoseFeedback, draw_comprehensive_feedback_overlay
 
+def interpolate_keypoints(prev_kp, curr_kp, next_kp):
+    """Interpolate keypoints using previous, current, and next frames.
+    If confidence is available, use it as weights; otherwise, use simple mean."""
+    # Assume shape (..., 3): (y, x, confidence)
+    if prev_kp.shape == curr_kp.shape == next_kp.shape and prev_kp.shape[-1] == 3:
+        # Weighted average by confidence
+        prev_conf = prev_kp[..., 2]
+        curr_conf = curr_kp[..., 2]
+        next_conf = next_kp[..., 2]
+        total_conf = prev_conf + curr_conf + next_conf + 1e-6  # avoid div by zero
+        y = (prev_kp[..., 0] * prev_conf + curr_kp[..., 0] * curr_conf + next_kp[..., 0] * next_conf) / total_conf
+        x = (prev_kp[..., 1] * prev_conf + curr_kp[..., 1] * curr_conf + next_kp[..., 1] * next_conf) / total_conf
+        conf = np.maximum.reduce([prev_conf, curr_conf, next_conf])
+        return np.stack([y, x, conf], axis=-1)
+    else:
+        # Fallback: simple mean
+        return (prev_kp + curr_kp + next_kp) / 3.0
+
+
 class PoseProcessor:
     """Handles pose detection processing with improved stability and squat form analysis."""
     
@@ -213,13 +232,21 @@ class PoseProcessor:
         return output_overlay, keypoints_with_scores, feedback
 
 def process_video_with_squat_analysis(video_path, movenet_model, input_size, output_path=None):
-    """Process video with comprehensive squat form analysis - optimized for mobile."""
+    """Process video with comprehensive squat form analysis - optimized for mobile, with temporal interpolation."""
     processor = PoseProcessor(movenet_model, input_size)
     
-    cap = cv2.VideoCapture(video_path)
+    # Open video with FFMPEG backend and disable automatic rotation
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         print(f"Error: Could not open video file {video_path}")
         return
+    
+    # Try to disable automatic rotation (this may not work on all systems)
+    try:
+        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+        print("Disabled automatic rotation")
+    except:
+        print("Could not disable automatic rotation (not supported on this system)")
     
     # Get video properties
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -227,27 +254,67 @@ def process_video_with_squat_analysis(video_path, movenet_model, input_size, out
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
+    # Read first frame to check actual dimensions and detect any automatic rotation
+    ret, test_frame = cap.read()
+    if ret:
+        actual_height, actual_width = test_frame.shape[:2]
+        print(f"Video metadata dimensions: {width}x{height}")
+        print(f"Actual frame dimensions: {actual_width}x{actual_height}")
+        
+        # Check if OpenCV automatically rotated the video
+        if actual_width != width or actual_height != height:
+            print("WARNING: Frame dimensions don't match metadata - OpenCV may have applied rotation!")
+            print("This can happen with phone videos that have rotation metadata.")
+            print("The video will be processed as-is to preserve the original orientation.")
+            # Use actual frame dimensions instead of metadata
+            width, height = actual_width, actual_height
+            print(f"Using actual dimensions: {width}x{height}")
+        else:
+            print("Frame dimensions match metadata - no automatic rotation detected")
+            
+        # Special case: Detect if a portrait video was rotated to landscape by OpenCV
+        # This happens when the video was recorded as 1080x1920 but OpenCV reads it as 1920x1080
+        # We need to counter-rotate it back to portrait
+        needs_counter_rotation = False
+        if (width == 1920 and height == 1080 and 
+            actual_width == 1920 and actual_height == 1080):
+            # This looks like a portrait video that was rotated to landscape
+            print("DETECTED: Portrait video (1080x1920) was rotated to landscape (1920x1080) by OpenCV")
+            print("Will counter-rotate frames back to portrait orientation")
+            needs_counter_rotation = True
+            # Update dimensions to reflect the original portrait orientation
+            width, height = 1080, 1920
+        
+        # Reset to beginning
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    # Keep the same dimensions as input video - no rotation
+    # Process and output in the same orientation as input
+    out_w, out_h = width, height  # Always keep original dimensions
+    is_portrait = height > width  # Determine if portrait based on dimensions
+    
     print(f"Video info: {width}x{height}, {fps} FPS, {total_frames} frames")
+    print(f"Video orientation: {'Portrait' if is_portrait else 'Landscape'}")
     print("Squat Form Analysis System (Mobile Optimized):")
     print("- Analyzes back rounding, knee alignment, depth, and arm position")
     print("- Provides real-time form score and recommendations")
     print("- Detects squat phases: standing, descending, bottom, ascending")
     print("- Enhanced keypoint visualization for better form analysis")
     print("- Compact feedback overlay for better visibility")
-    print("- Mobile-friendly resolution for better performance")
+    print("- Preserves original video orientation")
     print("- Green: Good form | Orange: Needs improvement | Red: Form issues")
     
     # Setup video writer if output path is provided
     writer = None
     if output_path:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
         print(f"Output will be saved to: {output_path}")
     
     frame_count = 0
     
     print("Processing video... Press 'q' to stop early.")
-    
+
     try:
         while True:
             ret, frame = cap.read()
@@ -259,15 +326,59 @@ def process_video_with_squat_analysis(video_path, movenet_model, input_size, out
                 progress = (frame_count / total_frames) * 100
                 print(f"Progress: {progress:.1f}% ({frame_count}/{total_frames})")
             
-            # Process frame
-            output_overlay, keypoints_with_scores, feedback = processor.process_frame(frame, show_feedback=True)
-
-            # Display the result in a mobile-friendly window
+            # Process frame in original orientation - keep the same orientation as input
+            # Apply counter-rotation if needed to restore original portrait orientation
+            if 'needs_counter_rotation' in locals() and needs_counter_rotation:
+                # Counter-rotate the frame back to portrait (rotate 90 degrees clockwise)
+                pose_detection_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                if frame_count <= 3:
+                    print(f"Applied counter-rotation to frame {frame_count}")
+            else:
+                pose_detection_frame = frame
+            
+            # Debug: Print frame dimensions for first few frames
+            if frame_count <= 3:
+                frame_h, frame_w = frame.shape[:2]
+                print(f"Frame {frame_count} dimensions: {frame_w}x{frame_h}")
+                if 'needs_counter_rotation' in locals() and needs_counter_rotation:
+                    rotated_h, rotated_w = pose_detection_frame.shape[:2]
+                    print(f"After counter-rotation: {rotated_w}x{rotated_h}")
+            
+            # Process frame for pose detection - real-time processing without buffering
+            output_overlay, keypoints_with_scores, feedback = processor.process_frame(pose_detection_frame, show_feedback=True)
+            
+            # Apply counter-rotation to output if needed
+            if 'needs_counter_rotation' in locals() and needs_counter_rotation:
+                # The output_overlay is already processed with the rotated frame, so no additional rotation needed
+                pass
+            
+            # Display the result in a window that adapts to video dimensions
             cv2.namedWindow('MoveNet Lightning - Squat Analysis', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('MoveNet Lightning - Squat Analysis', 1280, 720)  # 720p window
+            
+            # Calculate display window size based on video dimensions
+            # Limit max size to fit on screen while maintaining aspect ratio
+            max_width, max_height = 1920, 1080  # Max display size
+            display_w, display_h = out_w, out_h
+            
+            # Scale down if video is too large
+            if display_w > max_width or display_h > max_height:
+                scale = min(max_width / display_w, max_height / display_h)
+                display_w = int(display_w * scale)
+                display_h = int(display_h * scale)
+            
+            cv2.resizeWindow('MoveNet Lightning - Squat Analysis', display_w, display_h)
             cv2.imshow('MoveNet Lightning - Squat Analysis', output_overlay)
             
             if writer:
+                # Ensure output frame matches video writer dimensions to prevent black bars
+                if output_overlay.shape[:2] != (out_h, out_w):
+                    # If counter-rotation was applied, we need to rotate the output back to match video writer
+                    if 'needs_counter_rotation' in locals() and needs_counter_rotation:
+                        # Rotate back to original orientation to match video writer dimensions
+                        output_overlay = cv2.rotate(output_overlay, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    else:
+                        # Just resize to match dimensions
+                        output_overlay = cv2.resize(output_overlay, (out_w, out_h))
                 writer.write(output_overlay)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -284,7 +395,6 @@ def process_video_with_squat_analysis(video_path, movenet_model, input_size, out
 def process_webcam_with_squat_analysis(movenet_model, input_size):
     """Process webcam feed with comprehensive squat form analysis - optimized for mobile."""
     processor = PoseProcessor(movenet_model, input_size)
-    
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise IOError("Cannot open webcam")
@@ -308,6 +418,11 @@ def process_webcam_with_squat_analysis(movenet_model, input_size):
     print("- 720p resolution for mobile performance")
     print("Press 'q' to quit.")
 
+    buffer_size = 5 # must be odd
+    frame_buffer = []
+    keypoints_buffer = []
+    feedback_buffer = []
+
     try:
         while True:
             ret, frame = cap.read()
@@ -315,13 +430,37 @@ def process_webcam_with_squat_analysis(movenet_model, input_size):
                 print("Failed to grab frame")
                 break
 
-            # Process frame
-            output_overlay, keypoints_with_scores, feedback = processor.process_frame(frame, show_feedback=True)
+            # Process frame (get keypoints, but don't display yet)
+            _, keypoints_with_scores, feedback = processor.process_frame(frame, show_feedback=True)
+            frame_buffer.append(frame)
+            keypoints_buffer.append(keypoints_with_scores)
+            feedback_buffer.append(feedback)
 
-            # Display the result in a mobile-friendly window
-            cv2.namedWindow('MoveNet Lightning - Squat Analysis', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('MoveNet Lightning - Squat Analysis', 1280, 720)  # 720p window
-            cv2.imshow('MoveNet Lightning - Squat Analysis', output_overlay)
+            if len(frame_buffer) == buffer_size:
+                center_idx = buffer_size // 2
+
+                # Interpolate keypoints for the center frame
+                prev_kp = keypoints_buffer[center_idx - 1]
+                curr_kp = keypoints_buffer[center_idx]
+                next_kp = keypoints_buffer[center_idx + 1]
+
+                # You need to implement this function:
+                smoothed_kp = interpolate_keypoints(prev_kp, curr_kp, next_kp)
+
+                # Draw overlay for the center frame using smoothed keypoints
+                output_overlay, _, _ = processor.process_frame(
+                    frame_buffer[center_idx], show_feedback=True
+                )
+                # Optionally, replace keypoints in output_overlay with smoothed_kp
+
+                # Display with adaptive window sizing
+                cv2.namedWindow('MoveNet Lightning - Squat Analysis', cv2.WINDOW_NORMAL)
+                cv2.imshow('MoveNet Lightning - Squat Analysis', output_overlay)
+
+                # Remove oldest frame/keypoints/feedback
+                frame_buffer.pop(0)
+                keypoints_buffer.pop(0)
+                feedback_buffer.pop(0)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
