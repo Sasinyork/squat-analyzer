@@ -107,24 +107,34 @@ class SquatFormAnalyzer:
             movement_direction = self.detect_movement_direction(hip_y)
             
             # Determine phase based on position AND movement
+            # Additional rule: treat the local minimum of the hip trajectory as bottom (brief pause),
+            # even if depth is above parallel. This is robust to shallower reps.
+            is_local_min_bottom = False
+            recent_positions = self.hip_positions[-5:] if len(self.hip_positions) >= 3 else self.hip_positions
+            if len(recent_positions) >= 3:
+                max_recent = max(recent_positions)
+                # Consider within 6 pixels of the recent maximum (lowest point in image coords) as bottom
+                if abs(hip_y - max_recent) <= 6:
+                    # And only when movement is stable or direction is changing
+                    if movement_direction in ("stable",) or (len(self.hip_positions) >= 3 and recent_positions[-1] <= recent_positions[-2]):
+                        is_local_min_bottom = True
+
             # Standing: Hip well above knee (negative difference in image coords)
-            if hip_knee_diff < self.standing_threshold:
+            if hip_knee_diff < self.standing_threshold and not is_local_min_bottom:
                 if movement_direction == "stable":
                     new_phase = "standing"
                 elif movement_direction == "descending":
                     new_phase = "descending"
                 else:
                     new_phase = "standing"  # Default to standing if unclear
-                    
-            # Bottom: Hip close to or below knee level (for depth analysis)
-            elif hip_knee_diff > self.bottom_threshold:
-                if movement_direction == "ascending":
+
+            # Bottom: Either hip near/below knee OR local minimum detected
+            elif hip_knee_diff > self.bottom_threshold or is_local_min_bottom:
+                if movement_direction == "ascending" and not is_local_min_bottom:
                     new_phase = "ascending"
-                elif movement_direction == "stable":
-                    new_phase = "bottom"
                 else:
-                    new_phase = "bottom"  # Default to bottom if unclear
-                    
+                    new_phase = "bottom"
+
             # Transition zone: Between standing and bottom
             else:
                 if movement_direction == "descending":
@@ -211,7 +221,7 @@ class SquatFormAnalyzer:
                         issues.append({
                             'type': 'back_rounding',
                             'severity': 'high' if back_angle < (angle_threshold - 10) else 'medium',
-                            'message': f'Back is rounding (angle: {back_angle:.1f}°)',
+                            'message': 'Back is rounding',
                             'recommendation': 'Keep chest up and back straight'
                         })
             
@@ -277,18 +287,6 @@ class SquatFormAnalyzer:
                     'recommendation': 'Keep knees behind toes, sit back more'
                 })
             
-            # Only check for knee valgus in front/angled views (not side view)
-            if view_angle != "side":
-                knee_distance = abs(left_knee[0] - right_knee[0])
-                ankle_distance = abs(left_ankle[0] - right_ankle[0])
-                
-                if knee_distance < ankle_distance * 0.8:  # Knees too close together
-                    issues.append({
-                        'type': 'knee_valgus',
-                        'severity': 'high',
-                        'message': 'Knees are caving inward',
-                        'recommendation': 'Push knees outward, keep them aligned'
-                    })
     
         return issues
     
@@ -327,13 +325,15 @@ class SquatFormAnalyzer:
             
             if should_analyze:
                 good_depth_tolerance = 0.05  # 5% of image height tolerance
-                if hip_center[1] < knee_center[1]:
-                    # Hip above knee - insufficient depth
+                # Allow hip to be slightly above knee (more lenient depth requirement)
+                depth_allowance = 0.02 * image_height  # 2% of image height above knee level
+                if hip_center[1] < knee_center[1] - depth_allowance:
+                    # Hip too far above knee - insufficient depth
                     issues.append({
                         'type': 'insufficient_depth',
                         'severity': 'medium',
                         'message': 'Squat depth is insufficient',
-                        'recommendation': 'Go deeper - hips should at least be parallel with knees'
+                        'recommendation': 'Go deeper - hips should be at least parallel with knees'
                     })
                 # good depth is when hip is aligned with knee level
                 elif abs(hip_center[1] - knee_center[1]) <= good_depth_tolerance * image_height:
@@ -346,6 +346,7 @@ class SquatFormAnalyzer:
                     pass
         
         return issues
+    
     
     def analyze_arm_position(self, keypoints, image_height, image_width):
         """Analyze arm position during squat."""
@@ -380,7 +381,7 @@ class SquatFormAnalyzer:
         return issues
     
     def analyze_squat_form(self, keypoints_with_scores, image_height, image_width):
-        """Squat form analysis focused only on depth."""
+        """Squat form analysis including depth and back rounding."""
         keypoints = keypoints_with_scores[0, 0, :, :]
         
         # Detect squat phase
@@ -397,21 +398,27 @@ class SquatFormAnalyzer:
         if phase == "bottom":
             show_depth_feedback = True
         
-        # Always run analyze_depth, but only show feedback if show_depth_feedback is True
+        # Always run analyze_depth/back, but only show depth feedback if show_depth_feedback is True
         depth_issues = self.analyze_depth(keypoints, image_height, image_width)
+        back_issues = self.analyze_back_form(keypoints, image_height, image_width)
         
         # If we're descending and have depth issues, show feedback
         if phase == "descending" and depth_issues:
             show_depth_feedback = True
         
+        # Merge all detected issues for scoring and recommendations
+        all_issues = []
+        all_issues.extend(depth_issues)
+        all_issues.extend(back_issues)
+
         feedback = {
             'phase': phase,
             'phase_frames': self.phase_frames,
-            'issues': depth_issues,
+            'issues': all_issues,
             'depth_metric': depth_metric,
-            'overall_score': self.calculate_form_score(depth_issues),
-            'primary_issue': self.get_primary_issue(depth_issues),
-            'recommendations': self.get_recommendations(depth_issues)
+            'overall_score': self.calculate_form_score(all_issues),
+            'primary_issue': self.get_primary_issue(all_issues),
+            'recommendations': self.get_recommendations(all_issues)
         }
         
         if show_depth_feedback:
@@ -427,6 +434,14 @@ class SquatFormAnalyzer:
         else:
             feedback['depth_status'] = None
             feedback['depth_message'] = None
+
+        # Back rounding feedback (always show if detected)
+        if back_issues:
+            feedback['back_status'] = 'needs_improvement'
+            feedback['back_message'] = next((i['message'] for i in back_issues if i['type'] == 'back_rounding'), back_issues[0]['message'])
+        else:
+            feedback['back_status'] = 'good'
+            feedback['back_message'] = 'Good back position - neutral spine maintained'
         
         self.feedback_history.append(feedback)
         if len(self.feedback_history) > 10:
@@ -450,7 +465,7 @@ class SquatFormAnalyzer:
             return None
         
         # Prioritize by severity and type
-        priority_order = ['back_rounding', 'knee_valgus', 'knee_alignment', 
+        priority_order = ['back_rounding', 'knee_alignment', 
                          'insufficient_depth', 'shoulder_tilt', 'arm_position']
         
         for priority_type in priority_order:

@@ -48,7 +48,7 @@ def main():
     print("Detects: back rounding, knee alignment, depth, arm position")
     print("=" * 50)
     
-    print("\nLoading MoveNet Lightning TFLite model...")
+    print("\nLoading MoveNet Lightning model...")
     global movenet, input_size
     movenet, input_size = load_movenet_model()
     print(f"Model loaded! Input size: {input_size}x{input_size}")

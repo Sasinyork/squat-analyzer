@@ -1,40 +1,55 @@
 import tensorflow as tf
+import tensorflow_hub as hub
 import os
-import requests
+import time
 
-def download_tflite_model(url, filename="model.tflite"):
-    """Downloads the TFLite model file from TensorFlow Hub."""
-    if not os.path.exists(filename):
-        response = requests.get(url)
-        with open(filename, "wb") as f:
-            f.write(response.content)
+# Global cache for model to avoid reloading
+_model_cache = None
 
 def load_movenet_model(custom_model_path=None):
-    """Loads MoveNet Lightning TFLite model optimized for mobile/Android."""
+    """Loads MoveNet SinglePose Lightning SavedModel with minimal optimizations."""
+    global _model_cache
     
-    if custom_model_path and os.path.exists(custom_model_path):
-        # Use custom trained model
-        print(f"Loading custom trained model: {custom_model_path}")
-        model_path = custom_model_path
-    else:
-        # Use pre-trained model
-        print("Loading pre-trained MoveNet Lightning model...")
-        url = "https://tfhub.dev/google/lite-model/movenet/singlepose/lightning/tflite/float16/4?lite-format=tflite"
-        download_tflite_model(url)
-        model_path = "model.tflite"
+    # Return cached model if available
+    if _model_cache is not None:
+        print("Using cached MoveNet model (instant loading)...")
+        return _model_cache
     
-    input_size = 192  # Default for Lightning model
+    start_time = time.time()
+    
+    print("Loading MoveNet Lightning model...")
+    # Official TF Hub SavedModel for MoveNet SinglePose Lightning
+    model_url = "https://tfhub.dev/google/movenet/singlepose/lightning/4"
 
-    interpreter = tf.lite.Interpreter(model_path=model_path)
-    interpreter.allocate_tensors()
+    # Resolve to local cache path (downloads once, then reused offline)
+    print("Resolving model path...")
+    resolve_start = time.time()
+    resolved_path = hub.resolve(model_url)
+    resolve_time = time.time() - resolve_start
+    print(f"Model path resolved in {resolve_time:.2f} seconds")
+    
+    print("Loading SavedModel...")
+    load_start = time.time()
+    module = tf.saved_model.load(resolved_path)
+    load_time = time.time() - load_start
+    print(f"SavedModel loaded in {load_time:.2f} seconds")
+    
+    serving_fn = module.signatures["serving_default"]
 
-    def movenet(input_image):
-        input_image = tf.cast(input_image, dtype=tf.uint8)
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        interpreter.set_tensor(input_details[0]['index'], input_image.numpy())
-        interpreter.invoke()
-        keypoints_with_scores = interpreter.get_tensor(output_details[0]['index'])
+    input_size = 192  # Lightning expects 192x192
+
+    def movenet(input_image: tf.Tensor):
+        # MoveNet SavedModel expects int32 input in range [0,255] with shape [1, 192, 192, 3]
+        input_image_int = tf.cast(input_image, dtype=tf.int32)
+        outputs = serving_fn(input_image_int)
+        # Output key is typically 'output_0'
+        keypoints_with_scores = outputs["output_0"].numpy()
         return keypoints_with_scores
 
+    # Cache the result
+    _model_cache = (movenet, input_size)
+    
+    load_time = time.time() - start_time
+    print(f"Model loaded in {load_time:.2f} seconds")
+    
     return movenet, input_size
