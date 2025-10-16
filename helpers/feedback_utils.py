@@ -1,10 +1,11 @@
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
-from .squat_analyzer import SquatFormAnalyzer
+from helpers.analyzers.squat_analyzer import SquatFormAnalyzer
+from helpers.analyzers.bench_analyzer import BenchPressFormAnalyzer
 
 class PoseFeedback:
-    """Handles real-time feedback for pose detection positioning and squat form."""
+    """Handles real-time feedback for pose detection positioning and exercise form."""
     
     def __init__(self):
         self.stable_frames = 0
@@ -15,11 +16,39 @@ class PoseFeedback:
         self.frames_since_movement = 0
         self.movement_threshold = 0.05  # Reduced sensitivity
         self.stability_frames_needed = 15  # Need to hold still for 15 frames (0.5 seconds at 30fps)
-        self.feedback_persistence_frames = 90  # Keep feedback for 3 seconds (90 frames at 30fps)
-        
-        # Initialize squat form analyzer
+        self.feedback_persistence_frames = 45  # Keep feedback for 1.5 seconds (45 frames at 30fps)
+
+        # For persistent actionable feedback
+        self.last_actionable_feedback = []
+        self.last_actionable_frame = 0
+
+        # Initialize exercise analyzers
         self.squat_analyzer = SquatFormAnalyzer()
+        self.bench_analyzer = BenchPressFormAnalyzer()
+        try:
+            from helpers.analyzers.deadlift_analyzer import DeadliftFormAnalyzer
+            self.deadlift_analyzer = DeadliftFormAnalyzer()
+        except Exception:
+            self.deadlift_analyzer = None
         self.form_analysis_enabled = True
+
+        # Exercise mode settings
+        self.exercise_mode = "squat"  # Default to squat mode
+    
+    def set_exercise_mode(self, mode):
+        """Set the exercise mode for analysis."""
+        if mode in ["squat", "bench", "deadlift"]:
+            self.exercise_mode = mode
+            print(f"Exercise mode set to: {mode.upper()}")
+            if mode == "deadlift" and (not hasattr(self, "deadlift_analyzer") or self.deadlift_analyzer is None):
+                try:
+                    from .deadlift_analyzer import DeadliftFormAnalyzer
+                    self.deadlift_analyzer = DeadliftFormAnalyzer()
+                except Exception:
+                    self.deadlift_analyzer = None
+        else:
+            print(f"Unknown exercise mode: {mode}. Using default: squat")
+            self.exercise_mode = "squat"
     
     def calculate_person_center_and_size(self, keypoints_with_scores, image_height, image_width):
         """Calculate the center and size of the person more reliably."""
@@ -88,7 +117,7 @@ class PoseFeedback:
             self.frames_since_movement += 1
             return False, "stable"
     
-    def get_comprehensive_feedback(self, keypoints_with_scores, image_height, image_width):
+    def get_comprehensive_feedback(self, keypoints_with_scores, image_height, image_width, frame_idx=None):
         """Get comprehensive feedback including positioning and squat form."""
         keypoints = keypoints_with_scores[0, 0, :, :]
         
@@ -126,10 +155,15 @@ class PoseFeedback:
         # if movement_type == "stable": ...
         # Instead, always show form feedback below:
         
-        # Get squat form analysis if enabled
+        # Get exercise form analysis if enabled
         form_analysis = None
         if self.form_analysis_enabled and visibility_percentage > 70:  # Only analyze if good visibility
-            form_analysis = self.squat_analyzer.analyze_squat_form(keypoints_with_scores, image_height, image_width)
+            if self.exercise_mode == "squat":
+                form_analysis = self.squat_analyzer.analyze_squat_form(keypoints_with_scores, image_height, image_width)
+            elif self.exercise_mode == "bench":
+                form_analysis = self.bench_analyzer.analyze_bench_press_form(keypoints_with_scores, image_height, image_width)
+            elif self.exercise_mode == "deadlift" and hasattr(self, "deadlift_analyzer") and self.deadlift_analyzer is not None:
+                form_analysis = self.deadlift_analyzer.analyze_deadlift_form(keypoints_with_scores, image_height, image_width)
         
         feedback = {
             'message': '',
@@ -139,22 +173,64 @@ class PoseFeedback:
             'person_percentage': person_percentage,
             'visibility_percentage': visibility_percentage,
             'is_stable': True,
-            'form_analysis': form_analysis
+            'form_analysis': form_analysis,
+            'exercise_mode': self.exercise_mode
         }
         
         # Only show form feedback
         if form_analysis:
-            if form_analysis.get('depth_message'):
-                # Only show depth message in overlay, not as main message
-                feedback['message'] = ''
-                if form_analysis.get('depth_status') == 'good':
-                    feedback['color'] = (0, 255, 0)
-                elif form_analysis.get('depth_status') == 'needs_improvement':
-                    feedback['color'] = (0, 165, 255)
+            if self.exercise_mode == "squat":
+                if form_analysis.get('depth_message'):
+                    feedback['message'] = ''
+                    if form_analysis.get('depth_status') == 'good':
+                        feedback['color'] = (0, 255, 0)
+                    elif form_analysis.get('depth_status') == 'needs_improvement':
+                        feedback['color'] = (0, 165, 255)
+                    else:
+                        feedback['color'] = (255, 255, 255)
+                if form_analysis.get('recommendations'):
+                    feedback['recommendation'] = form_analysis['recommendations'][0]
+            elif self.exercise_mode == "bench":
+                phase = form_analysis.get('phase')
+                if phase:
+                    phase_title = phase.capitalize()
+                    feedback['message'] = f"Bench: {phase_title}"
+                    color_map = {
+                        'pressing': (0, 255, 0),
+                        'lowering': (0, 165, 255),
+                        'bottom': (0, 255, 255),
+                        'rest': (255, 255, 255),
+                        'pause': (255, 255, 255),
+                        'stable': (255, 255, 255)
+                    }
+                    feedback['color'] = color_map.get(phase, (255, 255, 255))
+            elif self.exercise_mode == "deadlift":
+                phase = form_analysis.get('phase')
+                if phase:
+                    phase_title = phase.capitalize()
+                    feedback['message'] = f"Deadlift: {phase_title}"
+                    color_map = {
+                        'ascending': (0, 255, 0),
+                        'lowering': (0, 165, 255),
+                        'bottom': (0, 255, 255),
+                        'standing': (255, 255, 255)
+                    }
+                    feedback['color'] = color_map.get(phase, (255, 255, 255))
+                # Show persistent actionable feedback for deadlift
+                actionable = form_analysis.get('recommendations', [])
+                if frame_idx is not None:
+                    if actionable and actionable != self.last_actionable_feedback:
+                        self.last_actionable_feedback = actionable
+                        self.last_actionable_frame = frame_idx
+                    elif (frame_idx - self.last_actionable_frame) < self.feedback_persistence_frames:
+                        actionable = self.last_actionable_feedback
+                    else:
+                        self.last_actionable_feedback = []
+                        actionable = []
+                if actionable:
+                    feedback['recommendation'] = actionable[0]
                 else:
-                    feedback['color'] = (255, 255, 255)
-            if form_analysis.get('recommendations'):
-                feedback['recommendation'] = form_analysis['recommendations'][0]
+                    feedback['recommendation'] = ''
         else:
             feedback['message'] = "Hold still for form feedback"
             feedback['color'] = (0, 165, 255)
@@ -234,36 +310,38 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     status_lines = 0
     if feedback.get('form_analysis'):
         form_analysis = feedback['form_analysis']
-        if form_analysis.get('back_message') and form_analysis.get('back_status') is not None:
+        # Deadlift: show hip extension cue if present
+        if feedback.get('exercise_mode') == 'deadlift' and form_analysis.get('hip_extension_message'):
             status_lines += 1
-        if form_analysis.get('depth_message') and form_analysis.get('depth_status') is not None:
-            status_lines += 1
+            extra_height += 24 + 10
+        else:
+            if form_analysis.get('back_message') and form_analysis.get('back_status') is not None:
+                status_lines += 1
+            if form_analysis.get('depth_message') and form_analysis.get('depth_status') is not None:
+                status_lines += 1
+            if status_lines > 1:
+                extra_height += (status_lines - 1) * 26
+            if form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0:
+                recommendation_text = form_analysis['recommendations'][0]
+                max_chars_per_line = 65
+                if len(recommendation_text) > max_chars_per_line:
+                    estimated_lines = max(1, len(recommendation_text) // max_chars_per_line + 1)
+                    extra_height += (estimated_lines * 24) + 10
+                else:
+                    extra_height += 24 + 10
+            if status_lines > 0 or (form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0):
+                pill_font = cv2.FONT_HERSHEY_SIMPLEX
+                pill_scale = 0.9
+                pill_thickness = 2
+                label = 'GOOD FORM' if (form_analysis.get('depth_status') == 'good' and form_analysis.get('back_status') == 'good') else 'INCORRECT FORM'
+                text_size = cv2.getTextSize(label, pill_font, pill_scale, pill_thickness)[0]
+                vertical_padding = 8
+                pill_height = text_size[1] + vertical_padding * 2
+                extra_height += pill_height + 16
 
-        # Each additional status line beyond the first needs vertical space
-        if status_lines > 1:
-            extra_height += (status_lines - 1) * 26  # 26px per extra line
-
-        # Add extra height for recommendations (wrapped into lines) using 24px per line to match rendering
-        if form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0:
-            recommendation_text = form_analysis['recommendations'][0]
-            max_chars_per_line = 65
-            if len(recommendation_text) > max_chars_per_line:
-                estimated_lines = max(1, len(recommendation_text) // max_chars_per_line + 1)
-                extra_height += (estimated_lines * 24) + 10  # line height + small padding
-            else:
-                extra_height += 24 + 10
-
-        # Reserve space for GOOD/INCORRECT pill at the bottom of the box (dynamic height approximation)
-        if status_lines > 0 or (form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0):
-            # Approximate pill height similar to later drawing calculation
-            pill_font = cv2.FONT_HERSHEY_SIMPLEX
-            pill_scale = 0.9
-            pill_thickness = 2
-            label = 'GOOD FORM' if (form_analysis.get('depth_status') == 'good' and form_analysis.get('back_status') == 'good') else 'INCORRECT FORM'
-            text_size = cv2.getTextSize(label, pill_font, pill_scale, pill_thickness)[0]
-            vertical_padding = 8
-            pill_height = text_size[1] + vertical_padding * 2
-            extra_height += pill_height + 16  # include margin above pill
+    # Bench mode: reserve space for phase and depth lines
+    if feedback.get('exercise_mode') == 'bench' and feedback.get('form_analysis'):
+        extra_height += 26 * 2  # Phase + Depth lines
     
     text_bg_height = base_height + extra_height
     
@@ -304,42 +382,59 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         # Draw form analysis if available (compact)
         if feedback.get('form_analysis'):
             form_analysis = feedback['form_analysis']
-            
-            # Show both back and depth messages, back first if present
-            lines_to_show = []
-            if form_analysis.get('back_message') and form_analysis.get('back_status'):
-                back_color = (0, 255, 0) if form_analysis['back_status'] == 'good' else (0, 165, 255)
-                lines_to_show.append((form_analysis['back_message'], back_color))
-            if form_analysis.get('depth_message') and form_analysis.get('depth_status'):
-                if form_analysis['depth_status'] == 'good':
-                    depth_color = (0, 255, 0)
-                elif form_analysis['depth_status'] == 'needs_improvement':
-                    depth_color = (0, 165, 255)
-                else:
-                    depth_color = (255, 255, 255)
-                lines_to_show.append((form_analysis['depth_message'], depth_color))
-
-            # Render up to two lines (back then depth)
-            for i, (text, color) in enumerate(lines_to_show[:2]):
-                if len(text) > 45:
-                    text = text[:42] + "..."
-                size = cv2.getTextSize(text, font, 0.9, 2)[0]
-                x = ((width - side_margin * 2) - size[0]) // 2 + side_margin
-                y = bg_y_start + 45 + i * 26
-                cv2.putText(image, text, (x, y), font, 0.9, color, 2)
-                
+            if feedback.get('exercise_mode') == 'deadlift':
+                # Collect all actionable recommendations for deadlift (hip, knee, spine)
+                recs = []
+                # Hip extension
+                if form_analysis.get('hip_extension_status') == 'needs_improvement' and form_analysis.get('hip_extension_message'):
+                    recs.append((form_analysis['hip_extension_message'], (0, 165, 255)))
+                # Knee issues
+                for issue in form_analysis.get('knee_issues', []):
+                    if 'recommendation' in issue:
+                        color = (0, 165, 255) if issue['severity'] in ('medium', 'high') else (0, 255, 0)
+                        recs.append((issue['recommendation'], color))
+                # Spine/torso issues
+                for issue in form_analysis.get('spine_issues', []):
+                    if 'recommendation' in issue:
+                        color = (0, 165, 255) if issue['severity'] in ('medium', 'high') else (0, 255, 0)
+                        recs.append((issue['recommendation'], color))
+                # Draw each recommendation line
+                for i, (text, color) in enumerate(recs):
+                    if len(text) > 60:
+                        text = text[:57] + "..."
+                    size = cv2.getTextSize(text, font, 0.9, 2)[0]
+                    x = ((width - side_margin * 2) - size[0]) // 2 + side_margin
+                    y = bg_y_start + 45 + i * 26
+                    cv2.putText(image, text, (x, y), font, 0.9, color, 2)
+            else:
+                # Show both back and depth messages, back first if present (squat)
+                lines_to_show = []
+                if form_analysis.get('back_message') and form_analysis.get('back_status'):
+                    back_color = (0, 255, 0) if form_analysis['back_status'] == 'good' else (0, 165, 255)
+                    lines_to_show.append((form_analysis['back_message'], back_color))
+                if form_analysis.get('depth_message') and form_analysis.get('depth_status'):
+                    if form_analysis['depth_status'] == 'good':
+                        depth_color = (0, 255, 0)
+                    elif form_analysis['depth_status'] == 'needs_improvement':
+                        depth_color = (0, 165, 255)
+                    else:
+                        depth_color = (255, 255, 255)
+                    lines_to_show.append((form_analysis['depth_message'], depth_color))
+                for i, (text, color) in enumerate(lines_to_show[:2]):
+                    if len(text) > 45:
+                        text = text[:42] + "..."
+                    size = cv2.getTextSize(text, font, 0.9, 2)[0]
+                    x = ((width - side_margin * 2) - size[0]) // 2 + side_margin
+                    y = bg_y_start + 45 + i * 26
+                    cv2.putText(image, text, (x, y), font, 0.9, color, 2)
                 # Show recommendation below depth message if available
                 if form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0:
                     recommendation_text = form_analysis['recommendations'][0]
-                    
-                    # Break long text into multiple lines instead of truncating
                     max_chars_per_line = 65
                     if len(recommendation_text) > max_chars_per_line:
-                        # Split text into lines
                         lines = []
                         words = recommendation_text.split()
                         current_line = ""
-                        
                         for word in words:
                             if len(current_line + " " + word) <= max_chars_per_line:
                                 current_line += (" " + word) if current_line else word
@@ -347,61 +442,57 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                                 if current_line:
                                     lines.append(current_line)
                                 current_line = word
-                        
                         if current_line:
                             lines.append(current_line)
                     else:
                         lines = [recommendation_text]
-                    
-                    # Draw each line below the status lines area to avoid overlap
-                    line_height = 24  # Increased space between lines for larger font
+                    line_height = 24
                     start_y = bg_y_start + 45 + (len(lines_to_show[:2]) * 26) + 20
                     for i, line in enumerate(lines):
-                        line_size = cv2.getTextSize(line, font, 0.75, 2)[0]  # Increased font size
+                        line_size = cv2.getTextSize(line, font, 0.75, 2)[0]
                         line_x = ((width - side_margin * 2) - line_size[0]) // 2 + side_margin
                         line_y = start_y + (i * line_height)
-                        
-                        # Use a different color for recommendations (cyan)
-                        recommendation_color = (255, 255, 0)  # Cyan for recommendations
+                        recommendation_color = (255, 255, 0)
                         cv2.putText(image, line, (line_x, line_y), font, 0.75, recommendation_color, 2)
             
-            # Add good/bad form indicator inside the feedback box at the bottom
-            # Good/bad indicator is GOOD only when depth is good AND back is good
-            depth_good = form_analysis.get('depth_status') == 'good'
-            back_good = form_analysis.get('back_status') == 'good'
-            has_any_status = form_analysis.get('depth_status') is not None or form_analysis.get('back_status') is not None
-            # Only show the GOOD/INCORRECT pill at the bottom of the squat
-            phase_is_bottom = form_analysis.get('phase') == 'bottom'
-            if phase_is_bottom and has_any_status:
-                is_good = depth_good and back_good
-                pill_color = (0, 255, 0) if is_good else (255, 0, 0)
-                label = 'GOOD FORM' if is_good else 'INCORRECT FORM'
+            # Add good/bad form indicator only for squat at bottom
+            if feedback.get('exercise_mode') != 'bench':
+                # Good/bad indicator is GOOD only when depth is good AND back is good
+                depth_good = form_analysis.get('depth_status') == 'good'
+                back_good = form_analysis.get('back_status') == 'good'
+                has_any_status = form_analysis.get('depth_status') is not None or form_analysis.get('back_status') is not None
+                # Only show the GOOD/INCORRECT pill at the bottom of the squat
+                phase_is_bottom = form_analysis.get('phase') == 'bottom'
+                if phase_is_bottom and has_any_status:
+                    is_good = depth_good and back_good
+                    pill_color = (0, 255, 0) if is_good else (255, 0, 0)
+                    label = 'GOOD FORM' if is_good else 'INCORRECT FORM'
 
-                # Compute pill dimensions based on text size
-                pill_font = cv2.FONT_HERSHEY_SIMPLEX
-                pill_scale = 0.9
-                pill_thickness = 2
-                text_size = cv2.getTextSize(label, pill_font, pill_scale, pill_thickness)[0]
-                horizontal_padding = 22
-                vertical_padding = 8
-                pill_width = text_size[0] + horizontal_padding * 2
-                pill_height = text_size[1] + vertical_padding * 2
+                    # Compute pill dimensions based on text size
+                    pill_font = cv2.FONT_HERSHEY_SIMPLEX
+                    pill_scale = 0.9
+                    pill_thickness = 2
+                    text_size = cv2.getTextSize(label, pill_font, pill_scale, pill_thickness)[0]
+                    horizontal_padding = 22
+                    vertical_padding = 8
+                    pill_width = text_size[0] + horizontal_padding * 2
+                    pill_height = text_size[1] + vertical_padding * 2
 
-                # Position centered at the very bottom inside the overlay box
-                available_width = x2 - x1
-                pill_x1 = x1 + max(10, (available_width - pill_width) // 2)
-                pill_x2 = pill_x1 + pill_width
-                pill_y2 = y2 - 10
-                pill_y1 = pill_y2 - pill_height
+                    # Position centered at the very bottom inside the overlay box
+                    available_width = x2 - x1
+                    pill_x1 = x1 + max(10, (available_width - pill_width) // 2)
+                    pill_x2 = pill_x1 + pill_width
+                    pill_y2 = y2 - 10
+                    pill_y1 = pill_y2 - pill_height
 
-                # Draw rounded pill inside the box
-                image = draw_rounded_rectangle_with_alpha(image, pill_x1, pill_y1, pill_x2, pill_y2, pill_color, alpha=0.95, radius=12)
+                    # Draw rounded pill inside the box
+                    image = draw_rounded_rectangle_with_alpha(image, pill_x1, pill_y1, pill_x2, pill_y2, pill_color, alpha=0.95, radius=12)
 
-                # Draw label centered in pill
-                text_x = pill_x1 + (pill_width - text_size[0]) // 2
-                text_y = pill_y1 + (pill_height + text_size[1]) // 2
-                text_color = (0, 0, 0) if is_good else (255, 255, 255)
-                cv2.putText(image, label, (text_x, text_y), pill_font, pill_scale, text_color, pill_thickness)
+                    # Draw label centered in pill
+                    text_x = pill_x1 + (pill_width - text_size[0]) // 2
+                    text_y = pill_y1 + (pill_height + text_size[1]) // 2
+                    text_color = (0, 0, 0) if is_good else (255, 255, 255)
+                    cv2.putText(image, label, (text_x, text_y), pill_font, pill_scale, text_color, pill_thickness)
     
     return image
 

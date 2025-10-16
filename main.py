@@ -1,109 +1,367 @@
-# main.py
-import tensorflow as tf
-import numpy as np
+#!/usr/bin/env python3
+"""
+Main.py with proper orientation handling and angle display.
+"""
+
+
 import cv2
-import os
-import helpers.visualization_utils as vis
-from helpers.model_utils import load_movenet_model
-from helpers.pose_processor import process_video_with_squat_analysis, process_webcam_with_squat_analysis
+import sys
+from helpers.utils.model_utils import load_movenet_model
+from helpers.pose_processor import PoseProcessor
+from helpers.analyzers.deadlift_analyzer import DeadliftFormAnalyzer
 
-# Global variables for model
-movenet = None
-input_size = None
+def analyze_video_with_orientation(video_path="data/bench/bench.mp4", exercise_mode="bench", max_frames=None, output_path=None):
+    """Analyze exercise video with real-time feedback display and proper orientation handling."""
+    
+    print(f"Loading MoveNet model...")
+    movenet, input_size = load_movenet_model("movenet_lightning")
+    
 
-def get_unique_output_path(base_path, suffix="_pose_detected"):
-    """Generate a unique output path by incrementing the filename if it already exists."""
-    # Create output directory if it doesn't exist
-    output_dir = "output"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    # Create processor and set exercise mode
+    processor = PoseProcessor(movenet, input_size)
+    processor.feedback.set_exercise_mode(exercise_mode)
+
+    # Attach deadlift analyzer if needed
+    if exercise_mode == "deadlift":
+        if not hasattr(processor.feedback, "deadlift_analyzer") or processor.feedback.deadlift_analyzer is None:
+            processor.feedback.deadlift_analyzer = DeadliftFormAnalyzer()
     
-    # Get the original filename
-    filename = os.path.basename(base_path)
-    name, ext = os.path.splitext(filename)
+    # Open video with proper orientation handling
+    print(f"Opening video: {video_path}")
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        print(f"Error: Could not open video {video_path}")
+        return
     
-    # Start with the base name
-    counter = 0
+    # Try to disable automatic rotation
+    try:
+        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+        print("✓ Disabled automatic rotation")
+    except Exception as e:
+        print(f"✗ Could not disable automatic rotation: {e}")
+    
+    # Get video properties and detect orientation
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    metadata_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    metadata_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Read first frame to check orientation
+    ret, test_frame = cap.read()
+    if not ret:
+        print("Error: Could not read first frame")
+        return
+    
+    actual_height, actual_width = test_frame.shape[:2]
+    print(f"Video metadata: {metadata_width}x{metadata_height}")
+    print(f"Actual frame: {actual_width}x{actual_height}")
+    
+    # Detect if this is a portrait video that was rotated by OpenCV
+    needs_counter_rotation = False
+    original_is_portrait = False
+    
+    if (metadata_width == 1920 and metadata_height == 1080 and 
+        actual_width == 1920 and actual_height == 1080):
+        print("DETECTED: Portrait video rotated to landscape by OpenCV")
+        needs_counter_rotation = True
+        original_is_portrait = True
+        display_width, display_height = 1080, 1920
+    else:
+        display_width, display_height = actual_width, actual_height
+        original_is_portrait = actual_height > actual_width
+    
+    print(f"Video orientation: {'Portrait' if original_is_portrait else 'Landscape'}")
+    print(f"Display dimensions: {display_width}x{display_height}")
+    print(f"Counter-rotation needed: {needs_counter_rotation}")
+    
+    print("DEBUG: About to configure bench/deadlift analyzer...")
+    print(f"DEBUG: exercise_mode = {exercise_mode}")
+    print(f"DEBUG: original_is_portrait = {original_is_portrait}")
+    if exercise_mode == "bench":
+        orientation = "portrait" if original_is_portrait else "landscape"
+        print(f"Configuring bench analyzer for {orientation} mode...")
+        try:
+            processor.feedback.bench_analyzer.set_video_orientation(orientation, needs_counter_rotation)
+            print(f"Successfully configured orientation: {orientation}, counter_rotation: {needs_counter_rotation}")
+        except Exception as e:
+            print(f"Error setting orientation: {e}")
+            import traceback
+            traceback.print_exc()
+    elif exercise_mode == "deadlift":
+        print("Deadlift mode: no orientation-specific configuration needed.")
+    else:
+        print(f"DEBUG: Skipping bench/deadlift analyzer config because exercise_mode is not 'bench' or 'deadlift'")
+    
+    # Reset to beginning
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    # Set up output video writer if output_path is provided
+    out = None
+    if output_path:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (display_width, display_height))
+        print(f"Output video will be saved to: {output_path}")
+    
+    print(f"Processing video in {exercise_mode.upper()} mode...")
+    print("Press 'q' to quit, 's' for squat mode, 'b' for bench mode, 'd' for deadlift mode, 'p' to pause")
+    
+    frame_count = 0
+    paused = False
+    
+    try:
+        while True:
+            if not paused:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if max_frames and frame_count >= max_frames:
+                    break
+                
+                frame_count += 1
+            
+            # Process frame with feedback (shows angles and phase info)
+            if not paused:
+                # Apply counter-rotation if needed to restore original orientation
+                if needs_counter_rotation:
+                    # Counter-rotate from landscape back to portrait (rotate 90 degrees clockwise)
+                    pose_detection_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                    if frame_count <= 3:
+                        print(f"Applied counter-rotation to frame {frame_count}")
+                else:
+                    pose_detection_frame = frame
+                
+                # Process the properly oriented frame
+                output_overlay, keypoints_with_scores, feedback = processor.process_frame(pose_detection_frame, show_feedback=True)
+                
+                # Adjust text positioning based on orientation
+                if original_is_portrait:
+                    # Portrait mode - adjust text positions for taller display
+                    info_x, info_y = 10, 50
+                    mode_x, mode_y = 10, 100
+                    font_scale = 0.8
+                else:
+                    # Landscape mode - use standard positions
+                    info_x, info_y = 10, 30
+                    mode_x, mode_y = 10, 60
+                    font_scale = 0.7
+                
+                # Add frame info
+                cv2.putText(output_overlay, f"Frame: {frame_count}", (info_x, info_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2)
+                
+                # Add mode indicator
+                mode_text = f"Mode: {processor.feedback.exercise_mode.upper()}"
+                cv2.putText(output_overlay, mode_text, (mode_x, mode_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), 2)
+                
+                # Save to output video if enabled
+                if out:
+                    # Ensure output frame matches the expected dimensions
+                    if output_overlay.shape[:2] != (display_height, display_width):
+                        output_overlay = cv2.resize(output_overlay, (display_width, display_height))
+                    out.write(output_overlay)
+            
+            # Display frame with proper window sizing
+            window_name = 'Exercise Analysis'
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            
+            # Set appropriate display size based on orientation
+            if original_is_portrait:
+                # Portrait video - make display window smaller but maintain aspect ratio
+                display_scale = min(800 / display_width, 1200 / display_height)
+                window_width = int(display_width * display_scale)
+                window_height = int(display_height * display_scale)
+            else:
+                # Landscape video - standard sizing
+                display_scale = min(1200 / display_width, 800 / display_height)
+                window_width = int(display_width * display_scale)
+                window_height = int(display_height * display_scale)
+            
+            cv2.resizeWindow(window_name, window_width, window_height)
+            cv2.imshow(window_name, output_overlay if not paused else (pose_detection_frame if not paused else frame))
+            
+            # Handle key presses
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord('q'):
+                print("Quit requested")
+                break
+            elif key == ord('b'):
+                processor.feedback.set_exercise_mode("bench")
+                print("Switched to BENCH PRESS mode")
+            elif key == ord('s'):
+                processor.feedback.set_exercise_mode("squat")
+                print("Switched to SQUAT mode")
+            elif key == ord('d'):
+                processor.feedback.set_exercise_mode("deadlift")
+                if not hasattr(processor.feedback, "deadlift_analyzer") or processor.feedback.deadlift_analyzer is None:
+                    processor.feedback.deadlift_analyzer = DeadliftFormAnalyzer()
+                print("Switched to DEADLIFT mode")
+            elif key == ord('p'):
+                paused = not paused
+                print("PAUSED" if paused else "RESUMED")
+            
+            # Print feedback every 30 frames
+            if not paused and frame_count % 30 == 0 and feedback and feedback.get('form_analysis'):
+                form = feedback['form_analysis']
+                if processor.feedback.exercise_mode == "bench":
+                    # Bench press specific feedback
+                    phase = form.get('phase', 'unknown')
+                    phase_frames = form.get('phase_frames', 0)
+                    depth_metric = form.get('depth_metric', 0)
+                    print(f"Frame {frame_count}: Phase: {phase} (frames: {phase_frames}) | Depth: {depth_metric:.1f}")
+                else:
+                    # Squat specific feedback
+                    print(f"Frame {frame_count}: {form.get('back_message', 'N/A')} | {form.get('depth_message', 'N/A')}")
+    
+    finally:
+        cap.release()
+        if out:
+            out.release()
+        cv2.destroyAllWindows()
+        print(f"Processed {frame_count} frames")
+
+def get_user_choices():
+    """Get user choices for exercise type, video, and output saving."""
+    import os
+    
+    # Choose exercise mode
+
+    print("\n=== Exercise Selection ===")
+    print("1. Squat")
+    print("2. Bench Press")
+    print("3. Deadlift")
+
     while True:
-        if counter == 0:
-            # First try without number
-            output_filename = f"{name}{suffix}{ext}"
-        else:
-            # Then try with incrementing numbers
-            output_filename = f"{name}{suffix}_{counter}{ext}"
-        
-        output_path = os.path.join(output_dir, output_filename)
-        
-        # If file doesn't exist, we can use this path
-        if not os.path.exists(output_path):
-            return output_path
-        
-        counter += 1
-
-def main():
-    """Main function to choose between webcam and video processing."""
-    print("MoveNet Lightning - Squat Form Analysis")
-    print("=" * 50)
-    print("Advanced pose detection with squat form analysis")
-    print("Detects: back rounding, knee alignment, depth, arm position")
-    print("=" * 50)
-    
-    print("\nLoading MoveNet Lightning model...")
-    global movenet, input_size
-    movenet, input_size = load_movenet_model()
-    print(f"Model loaded! Input size: {input_size}x{input_size}")
-    
-    print("\n" + "=" * 50)
-    print("1. Squat Form Analysis (Webcam)")
-    print("2. Squat Form Analysis (Video File)")
-    print("=" * 50)
-    
-    while True:
-        choice = input("Enter your choice (1-2): ").strip()
-        
+        choice = input("Choose exercise (1, 2, or 3): ").strip()
         if choice == "1":
-            print("\nStarting Squat Form Analysis with Webcam...")
-            print("Position yourself for squats and the system will analyze your form.")
-            print("Features:")
-            print("- Real-time form scoring")
-            print("- Back rounding detection")
-            print("- Knee alignment analysis")
-            print("- Squat depth monitoring")
-            print("- Arm position feedback")
-            print("- 1080p resolution for maximum clarity")
-            print("Press 'q' to quit.")
-            
-            try:
-                process_webcam_with_squat_analysis(movenet, input_size)
-            except KeyboardInterrupt:
-                print("\nStopped by user.")
+            exercise_mode = "squat"
             break
-            
         elif choice == "2":
-            print("\nSquat Form Analysis for Video File")
-            video_path = input("Enter the full path to your video file: ").strip()
-            
-            if not os.path.exists(video_path):
-                print(f"Error: File '{video_path}' does not exist.")
-                continue
-            
-            save_output = input("Save processed video? (y/n): ").strip().lower()
-            output_path = None
-            
-            if save_output == 'y':
-                output_path = get_unique_output_path(video_path, "_squat_analysis")
-                print(f"Output will be saved to: {output_path}")
-            
-            try:
-                process_video_with_squat_analysis(video_path, movenet, input_size, output_path)
-            except KeyboardInterrupt:
-                print("\nStopped by user.")
+            exercise_mode = "bench"
             break
-            
+        elif choice == "3":
+            exercise_mode = "deadlift"
+            break
         else:
-            print("Invalid choice. Please enter 1 or 2.")
+            print("Invalid choice. Please enter 1, 2, or 3.")
+    
+    # Choose video based on exercise mode
+    print(f"\n=== {exercise_mode.capitalize()} Video Selection ===")
+    
+
+    if exercise_mode == "squat":
+        videos = []
+        squat_dir = "data/squat"
+        if os.path.exists(squat_dir):
+            for file in os.listdir(squat_dir):
+                if file.endswith('.mp4'):
+                    videos.append(os.path.join(squat_dir, file))
+    elif exercise_mode == "bench":
+        videos = []
+        bench_dir = "data/bench"
+        if os.path.exists(bench_dir):
+            for file in os.listdir(bench_dir):
+                if file.endswith('.mp4'):
+                    videos.append(os.path.join(bench_dir, file))
+    elif exercise_mode == "deadlift":
+        videos = []
+        deadlift_dir = "data/deadlift"
+        if os.path.exists(deadlift_dir):
+            for file in os.listdir(deadlift_dir):
+                if file.endswith('.mp4'):
+                    videos.append(os.path.join(deadlift_dir, file))
+    
+
+    if not videos:
+        print(f"No {exercise_mode} videos found!")
+        return None, None, None
+    
+    # Display video options
+    for i, video in enumerate(videos, 1):
+        print(f"{i}. {os.path.basename(video)}")
+    
+    while True:
+        try:
+            choice = int(input(f"Choose video (1-{len(videos)}): ").strip())
+            if 1 <= choice <= len(videos):
+                video_path = videos[choice - 1]
+                break
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {len(videos)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+    
+    # Ask about saving output
+    print("\n=== Output Options ===")
+    while True:
+        save_choice = input("Do you want to save the processed video? (y/n): ").strip().lower()
+        if save_choice in ['y', 'yes']:
+            # Generate output filename
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            output_base = f"output/{base_name}_{exercise_mode}_analysis"
+            ext = ".mp4"
+            output_path = output_base + ext
+            import os
+            os.makedirs("output", exist_ok=True)
+            idx = 1
+            while os.path.exists(output_path):
+                output_path = f"{output_base}_{idx}{ext}"
+                idx += 1
+            break
+        elif save_choice in ['n', 'no']:
+            output_path = None
+            break
+        else:
+            print("Invalid choice. Please enter 'y' or 'n'.")
+    
+    return video_path, exercise_mode, output_path
 
 if __name__ == "__main__":
-    main()
-
-
+    # Check if command line arguments are provided (for backward compatibility)
+    if len(sys.argv) > 1:
+        # Use command line arguments
+        video_path = sys.argv[1]
+        exercise_mode = "bench"  # Default
+        output_path = None
+        max_frames = None
+        
+        # Auto-detect exercise mode from video path if not specified
+        if "squat" in video_path.lower():
+            exercise_mode = "squat"
+        elif "bench" in video_path.lower():
+            exercise_mode = "bench"
+        
+        if len(sys.argv) > 2:
+            output_path = sys.argv[2]
+            # Increment output_path if file exists
+            if output_path:
+                import os
+                base, ext = os.path.splitext(output_path)
+                candidate = output_path
+                idx = 1
+                while os.path.exists(candidate):
+                    candidate = f"{base}_{idx}{ext}"
+                    idx += 1
+                output_path = candidate
+        
+        if len(sys.argv) > 3:
+            exercise_mode = sys.argv[3]
+            
+        if len(sys.argv) > 4:
+            max_frames = int(sys.argv[4])
+    else:
+        # Interactive mode
+        result = get_user_choices()
+        if result[0] is None:  # No videos found
+            sys.exit(1)
+        
+        video_path, exercise_mode, output_path = result
+        max_frames = None
+    
+    print(f"\n=== Configuration ===")
+    print(f"Video: {video_path}")
+    print(f"Exercise: {exercise_mode}")
+    print(f"Output: {output_path if output_path else 'Display only'}")
+    print("")
+    
+    analyze_video_with_orientation(video_path, exercise_mode, max_frames, output_path)

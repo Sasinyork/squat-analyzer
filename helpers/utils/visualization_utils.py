@@ -224,8 +224,10 @@ def draw_prediction_on_image_enhanced(image, keypoints_with_scores, keypoint_thr
     keypoints = keypoints_with_scores[0, 0, :, :]  # Shape: (17, 3)
     
     # Enhanced threshold system for different body parts
-    # Core body parts (more important for squat analysis)
-    core_keypoints = [5, 6, 11, 12, 13, 14]  # Shoulders, hips, knees
+    # Torso keypoints (shoulders and hips) - most critical for midsection tracking
+    torso_keypoints = [5, 6, 11, 12]  # Shoulders, hips
+    # Core body parts (knees also important)
+    core_keypoints = [13, 14]  # Knees
     # Upper body parts
     upper_body_keypoints = [0, 1, 2, 3, 4, 7, 8, 9, 10]  # Head, arms
     # Lower body parts
@@ -236,9 +238,12 @@ def draw_prediction_on_image_enhanced(image, keypoints_with_scores, keypoint_thr
         confidence = keypoints[i, 2]
         
         # Use different thresholds for different body parts
-        if i in core_keypoints:
-            # Lower threshold for core parts (more important for squat analysis)
-            threshold = keypoint_threshold * 0.8
+        if i in torso_keypoints:
+            # Much lower threshold for torso (critical for midsection tracking)
+            threshold = keypoint_threshold * 0.5  # 50% of base threshold
+        elif i in core_keypoints:
+            # Lower threshold for knees
+            threshold = keypoint_threshold * 0.7
         elif i in upper_body_keypoints:
             # Medium threshold for upper body
             threshold = keypoint_threshold * 0.9
@@ -294,9 +299,12 @@ def draw_prediction_on_image_enhanced(image, keypoints_with_scores, keypoint_thr
         confidence1 = keypoints[edge_pair[0], 2]
         confidence2 = keypoints[edge_pair[1], 2]
         
-        # Use adaptive thresholds for edges
-        if edge_pair[0] in core_keypoints or edge_pair[1] in core_keypoints:
-            threshold = keypoint_threshold * 0.8
+        # Use adaptive thresholds for edges - very permissive for torso connections
+        torso_keypoints = {5, 6, 11, 12}
+        if edge_pair[0] in torso_keypoints or edge_pair[1] in torso_keypoints:
+            threshold = keypoint_threshold * 0.5  # 50% for torso connections
+        elif edge_pair[0] in [13, 14] or edge_pair[1] in [13, 14]:
+            threshold = keypoint_threshold * 0.7  # 70% for knee connections
         else:
             threshold = keypoint_threshold
         
@@ -333,23 +341,32 @@ def draw_prediction_on_image_adaptive(image, keypoints_with_scores, keypoint_thr
     keypoints = keypoints_with_scores[0, 0, :, :]  # Shape: (17, 3)
     
     # Adaptive threshold based on keypoint visibility
+    # Torso keypoints are critical for tracking
+    torso_keypoints = [5, 6, 11, 12]  # Shoulders and hips
     # Lower threshold for extremities (hands, feet) since they're more likely to be cut off
     extremity_keypoints = [9, 10, 15, 16]  # Left/right wrists and ankles
-    upper_body_keypoints = [5, 6, 7, 8]    # Shoulders and elbows
+    upper_body_keypoints = [7, 8]    # Elbows
+    knee_keypoints = [13, 14]  # Knees
     
     # Draw keypoints with adaptive thresholds
     for i in range(17):
         confidence = keypoints[i, 2]
         
         # Use different thresholds for different body parts
-        if i in extremity_keypoints:
+        if i in torso_keypoints:
+            # Much lower threshold for torso (critical for midsection tracking)
+            threshold = keypoint_threshold * 0.4  # 40% of base
+        elif i in knee_keypoints:
+            # Lower threshold for knees (important for squat analysis)
+            threshold = keypoint_threshold * 0.6
+        elif i in extremity_keypoints:
             # Lower threshold for hands/feet (they might be cut off)
             threshold = keypoint_threshold * 0.7
         elif i in upper_body_keypoints:
-            # Medium threshold for upper body
-            threshold = keypoint_threshold * 0.9
+            # Medium threshold for elbows
+            threshold = keypoint_threshold * 0.8
         else:
-            # Normal threshold for core body parts
+            # Normal threshold for head
             threshold = keypoint_threshold
         
         if confidence > threshold:
@@ -387,15 +404,21 @@ def draw_prediction_on_image_adaptive(image, keypoints_with_scores, keypoint_thr
                 cv2.circle(image, (x, y), radius, (255, 255, 255), 1)
     
     # Draw edges with adaptive logic
+    torso_set = {5, 6, 11, 12}
+    knee_set = {13, 14}
     for edge_pair, color in EDGE_COLORS.items():
         confidence1 = keypoints[edge_pair[0], 2]
         confidence2 = keypoints[edge_pair[1], 2]
         
-        # Use adaptive thresholds for edges
-        if edge_pair[0] in extremity_keypoints or edge_pair[1] in extremity_keypoints:
+        # Use adaptive thresholds for edges - prioritize torso connections
+        if edge_pair[0] in torso_set or edge_pair[1] in torso_set:
+            threshold = keypoint_threshold * 0.4  # 40% for torso connections
+        elif edge_pair[0] in knee_set or edge_pair[1] in knee_set:
+            threshold = keypoint_threshold * 0.6  # 60% for knee connections
+        elif edge_pair[0] in extremity_keypoints or edge_pair[1] in extremity_keypoints:
             threshold = keypoint_threshold * 0.7
         elif edge_pair[0] in upper_body_keypoints or edge_pair[1] in upper_body_keypoints:
-            threshold = keypoint_threshold * 0.9
+            threshold = keypoint_threshold * 0.8
         else:
             threshold = keypoint_threshold
         
@@ -430,10 +453,23 @@ def draw_prediction_on_image_simple(image, keypoints_with_scores, keypoint_thres
     # Extract keypoints
     keypoints = keypoints_with_scores[0, 0, :, :]  # Shape: (17, 3)
     
+    # Define torso keypoints for special handling
+    torso_keypoints = {5, 6, 11, 12}  # Shoulders and hips
+    knee_keypoints = {13, 14}
+    
     # Draw keypoints
     for i in range(17):
         confidence = keypoints[i, 2]
-        if confidence > keypoint_threshold:
+        
+        # Use lower threshold for torso keypoints
+        if i in torso_keypoints:
+            threshold = keypoint_threshold * 0.4  # 40% for torso
+        elif i in knee_keypoints:
+            threshold = keypoint_threshold * 0.6  # 60% for knees
+        else:
+            threshold = keypoint_threshold
+        
+        if confidence > threshold:
             x_norm = keypoints[i, 1]
             y_norm = keypoints[i, 0]
             
@@ -468,7 +504,15 @@ def draw_prediction_on_image_simple(image, keypoints_with_scores, keypoint_thres
         confidence1 = keypoints[edge_pair[0], 2]
         confidence2 = keypoints[edge_pair[1], 2]
         
-        if confidence1 > keypoint_threshold and confidence2 > keypoint_threshold:
+        # Use lower threshold for torso and knee connections
+        if edge_pair[0] in torso_keypoints or edge_pair[1] in torso_keypoints:
+            threshold = keypoint_threshold * 0.4  # 40% for torso
+        elif edge_pair[0] in knee_keypoints or edge_pair[1] in knee_keypoints:
+            threshold = keypoint_threshold * 0.6  # 60% for knees
+        else:
+            threshold = keypoint_threshold
+        
+        if confidence1 > threshold and confidence2 > threshold:
             x1_norm = keypoints[edge_pair[0], 1]
             y1_norm = keypoints[edge_pair[0], 0]
             x2_norm = keypoints[edge_pair[1], 1]
@@ -489,5 +533,138 @@ def draw_prediction_on_image_simple(image, keypoints_with_scores, keypoint_thres
             if (0 <= x1 < width and 0 <= y1 < height) or (0 <= x2 < width and 0 <= y2 < height):
                 thickness = max(2, int((confidence1 + confidence2) / 2 * 3))
                 cv2.line(image, (x1, y1), (x2, y2), color, thickness)
+    
+    return image
+
+def draw_prediction_on_image_bench_press(image, keypoints_with_scores, keypoint_threshold=0.15):
+    """Specialized visualization for bench press analysis with enhanced lower body detection."""
+    height, width, _ = image.shape
+    
+    # Extract keypoints
+    keypoints = keypoints_with_scores[0, 0, :, :]  # Shape: (17, 3)
+    
+    
+    # Define body part groups for adaptive thresholds
+    torso_keypoints = [5, 6, 11, 12]  # Shoulders, hips - critical for midsection
+    lower_body_keypoints = [13, 14, 15, 16]  # Knees, ankles
+    ankle_keypoints = [15, 16]  # Ankles specifically
+    knee_keypoints = [13, 14]   # Knees specifically
+    upper_body_keypoints = [0, 1, 2, 3, 4, 7, 8, 9, 10]
+    elbow_keypoints = [7, 8]
+    wrist_keypoints = [9, 10]
+    
+    # Draw keypoints with adaptive thresholds
+    for i in range(17):
+        confidence = keypoints[i, 2]
+        
+        # Use extremely low threshold for ankles in bench press (they're often at frame edge)
+        if i in ankle_keypoints:
+            threshold = keypoint_threshold * 0.1  # Extremely low threshold for ankles
+        elif i in knee_keypoints:
+            threshold = keypoint_threshold * 0.3  # Very low threshold for knees
+        elif i in torso_keypoints:
+            threshold = keypoint_threshold * 0.35  # Low threshold for torso (critical for tracking)
+        elif i in wrist_keypoints:
+            threshold = keypoint_threshold * 0.5  # lower threshold for wrists to reduce disappearance
+        elif i in elbow_keypoints:
+            threshold = keypoint_threshold * 0.6  # lower threshold for elbows
+        elif i in upper_body_keypoints:
+            threshold = keypoint_threshold * 0.8  # slightly lower for upper body in lying pose
+        else:
+            threshold = keypoint_threshold
+        
+        if confidence > threshold:
+            x_norm = keypoints[i, 1]
+            y_norm = keypoints[i, 0]
+            
+            # Convert to pixel coordinates
+            x = int(x_norm * width)
+            y = int(y_norm * height)
+            
+            # Allow keypoints to extend far beyond frame bounds (important for bench press)
+            x = max(-50, min(width + 50, x))
+            y = max(-50, min(height + 50, y))
+            
+            # Adjust circle size based on confidence and body part
+            if i in ankle_keypoints:
+                radius = int(3 + confidence * 5)  # Larger for ankles to make them more visible
+                thickness = 2
+            elif i in knee_keypoints:
+                radius = int(3 + confidence * 4)
+                thickness = 2
+            else:
+                radius = int(2 + confidence * 3)
+                thickness = 1
+            
+            # Enhanced color coding for bench press analysis
+            if i in [0, 1, 2, 3, 4]:  # Head
+                color = (0, 255, 255)  # Yellow
+            elif i in [5, 6, 7, 8, 9, 10]:  # Upper body (arms, shoulders)
+                color = (255, 0, 255)  # Magenta
+            elif i in [11, 12]:  # Hips
+                color = (0, 255, 0)  # Green
+            elif i in [13, 14]:  # Knees
+                color = (255, 165, 0)  # Orange
+            elif i in [15, 16]:  # Ankles - make them very visible
+                color = (255, 0, 0)  # Red - most important for bench press
+            else:
+                color = (255, 20, 147)  # Deep pink
+            
+            # Draw keypoint with enhanced visibility for lower body
+            # Always draw keypoints, even if they're outside bounds (important for bench press)
+            if i in ankle_keypoints:
+                # Draw a larger, more visible circle for ankles
+                cv2.circle(image, (x, y), radius + 2, color, -1)
+                cv2.circle(image, (x, y), radius + 2, (255, 255, 255), thickness + 1)
+            else:
+                cv2.circle(image, (x, y), radius, color, -1)
+                cv2.circle(image, (x, y), radius, (255, 255, 255), thickness)
+    
+    # Draw edges with enhanced logic for bench press
+    torso_set = {5, 6, 11, 12}
+    for edge_pair, color in EDGE_COLORS.items():
+        confidence1 = keypoints[edge_pair[0], 2]
+        confidence2 = keypoints[edge_pair[1], 2]
+        
+        # Use extremely low threshold for edges involving ankles and torso
+        if edge_pair[0] in ankle_keypoints or edge_pair[1] in ankle_keypoints:
+            threshold = keypoint_threshold * 0.1
+        elif edge_pair[0] in knee_keypoints or edge_pair[1] in knee_keypoints:
+            threshold = keypoint_threshold * 0.3
+        elif edge_pair[0] in torso_set or edge_pair[1] in torso_set:
+            threshold = keypoint_threshold * 0.35  # Low threshold for torso connections
+        elif edge_pair[0] in lower_body_keypoints or edge_pair[1] in lower_body_keypoints:
+            threshold = keypoint_threshold * 0.4
+        else:
+            threshold = keypoint_threshold
+        
+        if confidence1 > threshold and confidence2 > threshold:
+            x1_norm = keypoints[edge_pair[0], 1]
+            y1_norm = keypoints[edge_pair[0], 0]
+            x2_norm = keypoints[edge_pair[1], 1]
+            y2_norm = keypoints[edge_pair[1], 0]
+            
+            x1 = int(x1_norm * width)
+            y1 = int(y1_norm * height)
+            x2 = int(x2_norm * width)
+            y2 = int(y2_norm * height)
+            
+            # Allow edges to extend far beyond frame bounds
+            x1 = max(-50, min(width + 50, x1))
+            y1 = max(-50, min(height + 50, y1))
+            x2 = max(-50, min(width + 50, x2))
+            y2 = max(-50, min(height + 50, y2))
+            
+            # Enhanced line thickness for lower body edges
+            avg_confidence = (confidence1 + confidence2) / 2
+            if edge_pair[0] in ankle_keypoints or edge_pair[1] in ankle_keypoints:
+                thickness = max(4, int(avg_confidence * 6))  # Thicker lines for ankle connections
+            elif edge_pair[0] in lower_body_keypoints or edge_pair[1] in lower_body_keypoints:
+                thickness = max(3, int(avg_confidence * 5))  # Medium thickness for lower body
+            else:
+                thickness = max(2, int(avg_confidence * 3))  # Normal thickness for upper body
+            
+            # Always draw edges, even if they extend beyond bounds (important for bench press)
+            cv2.line(image, (x1, y1), (x2, y2), color, thickness)
     
     return image
