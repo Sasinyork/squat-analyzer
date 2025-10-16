@@ -1,7 +1,13 @@
 import cv2
 import tensorflow as tf
 import numpy as np
-from .visualization_utils import draw_prediction_on_image_simple, draw_prediction_on_image_adaptive, draw_prediction_on_image_enhanced
+from helpers.utils.visualization_utils import (
+    draw_prediction_on_image_simple,
+    draw_prediction_on_image_adaptive,
+    draw_prediction_on_image_enhanced,
+    draw_prediction_on_image_bench_press,
+    EDGE_COLORS,
+)
 from .feedback_utils import PoseFeedback, draw_comprehensive_feedback_overlay
 
 def interpolate_keypoints(prev_kp, curr_kp, next_kp):
@@ -17,8 +23,36 @@ class PoseProcessor:
         self.input_size = input_size
         self.feedback = PoseFeedback()
         
-        # No temporal smoothing: use raw model outputs only
-        self.prev_keypoints = None
+        # Pure spatio-temporal smoothing controls
+        self.spatiotemporal_enabled = False
+        self.temporal_alpha = 0.12    # weight toward previous (balanced for responsiveness)
+        self.spatial_beta = 0.03      # minimal spatial (reduce cross-keypoint noise)
+        self.conf_threshold = 0.12    # min confidence to trust current point
+        self.spatial_min_conf = 0.15  # min confidence to include neighbor
+        self._prev_smoothed = None    # (17,3) last smoothed
+        # Build adjacency list from skeleton edges
+        self._neighbors = self._build_neighbors()
+        # Outlier guard history (store last N smoothed frames for robust stats)
+        self._hist_len = 5  # Moderate history for noise detection without too much lag
+        self._hist = []  # list of (17,2) arrays of smoothed yx
+        self._mad_k = 3.5  # threshold multiplier (strict but not too strict)
+        self._pixel_step_frac = 0.10  # max per-frame step for low-confidence points
+        self.lead_gain = 0.0          # disable lookahead (causes overshoot with noisy data)
+        self.last_frame_shape = None
+        
+        # Movement consistency tracking
+        self._velocity_history = []  # Track velocity for consistency
+        self._velocity_hist_len = 3
+
+    def _build_neighbors(self):
+        neighbors = {i: set() for i in range(17)}
+        try:
+            for (a, b) in EDGE_COLORS.keys():
+                neighbors[a].add(b)
+                neighbors[b].add(a)
+        except Exception:
+            pass
+        return {i: sorted(list(s)) for i, s in neighbors.items()}
     
     def get_keypoint_confidence(self, keypoints, kp_idx):
         """Return confidence for a keypoint; kept for API compatibility."""
@@ -52,27 +86,234 @@ class PoseProcessor:
         """Deprecated: movement-based smoothing removed."""
         return np.zeros(current_kp.shape[0])
     
-    def apply_responsive_smoothing(self, current_keypoints, prev_keypoints):
-        """Deprecated: smoothing disabled; return current keypoints."""
-        return current_keypoints
+    def smooth_keypoints_ema(self, keypoints_with_scores):
+        """Pure spatio-temporal smoothing: blend current with previous smoothed (temporal)
+        and neighbor average (spatial). Expects shape (1,1,17,3) with (y,x,score)."""
+        if not self.spatiotemporal_enabled or keypoints_with_scores is None:
+            return keypoints_with_scores
+
+        kps = keypoints_with_scores[0, 0, :, :].copy()  # (17,3)
+        if self._prev_smoothed is None:
+            # First frame: initialize
+            self._prev_smoothed = kps.copy()
+            return keypoints_with_scores
+
+        conf = kps[:, 2].copy()
+        prev = self._prev_smoothed.copy()
+        alphaT = float(self.temporal_alpha)
+        betaS = float(self.spatial_beta)
+        gammaC = max(0.0, 1.0 - alphaT - betaS)  # weight for current
+        conf_thr = float(self.conf_threshold)
+        min_neigh_conf = float(self.spatial_min_conf)
+
+        # Compute neighbor averages for spatial term
+        neigh_avg = np.zeros((17, 2), dtype=np.float32)
+        for i in range(17):
+            neigh = self._neighbors.get(i, [])
+            pts = []
+            for j in neigh:
+                if conf[j] >= min_neigh_conf:
+                    pts.append([kps[j, 0], kps[j, 1]])
+            if pts:
+                pts_arr = np.array(pts, dtype=np.float32)
+                neigh_avg[i, 0] = float(np.mean(pts_arr[:, 0]))
+                neigh_avg[i, 1] = float(np.mean(pts_arr[:, 1]))
+            else:
+                # Fallback to previous smoothed as neighbor proxy if none confident
+                neigh_avg[i, 0] = prev[i, 0]
+                neigh_avg[i, 1] = prev[i, 1]
+
+        # Blend positions with confidence-aware weighting
+        for i in range(17):
+            conf_normalized = min(max(conf[i], 0.0), 1.0)
+            
+            # Calculate velocity (change from previous)
+            if len(self._hist) >= 1:
+                velocity = np.linalg.norm(kps[i, 0:2] - prev[i, 0:2])
+            else:
+                velocity = 0.0
+            
+            # Detect if this is likely noise vs real movement
+            # Very permissive - only flag obvious noise
+            is_likely_noise = (velocity > 0.05 and conf[i] < 0.25) or (velocity > 0.15 and conf[i] < 0.45)
+            
+            # REMOVED: Special torso handling that was causing lag
+            # All keypoints now use the same smoothing logic
+            
+            # Standard handling for all keypoints
+            if is_likely_noise:
+                # Noise detected: use heavy temporal smoothing
+                g = gammaC * 0.1
+            elif conf[i] >= conf_thr:
+                # Real movement: scale by confidence (very aggressive)
+                if conf[i] > 0.4:
+                    conf_scale = 6.0 + (conf_normalized - 0.4) / 0.6 * 14.0  # 6-20x for high confidence
+                else:
+                    conf_scale = 1.0 + (conf_normalized - conf_thr) / (0.4 - conf_thr) * 5.0
+                g = gammaC * conf_scale
+            else:
+                g = 0.0
+            
+            total_weight = g + alphaT + betaS
+            if total_weight > 0:
+                g_norm = g / total_weight
+                alpha_norm = alphaT / total_weight
+                beta_norm = betaS / total_weight
+            else:
+                g_norm = 0.0
+                alpha_norm = 1.0
+                beta_norm = 0.0
+            
+            kps[i, 0] = g_norm * kps[i, 0] + alpha_norm * prev[i, 0] + beta_norm * neigh_avg[i, 0]
+            kps[i, 1] = g_norm * kps[i, 1] + alpha_norm * prev[i, 1] + beta_norm * neigh_avg[i, 1]
+
+        # Velocity lookahead disabled to prevent overshoot with noisy detections
+        # (lead_gain = 0.0)
+        
+        # Robust outlier guard using short history and per-frame pixel clamp
+        kps[:, 0:2] = self._apply_outlier_guard(kps[:, 0:2], prev[:, 0:2], keypoints_with_scores)
+
+        # Update prev smoothed and history
+        self._prev_smoothed[:, 0:2] = kps[:, 0:2]
+        self._prev_smoothed[:, 2] = kps[:, 2]
+        self._push_history(kps[:, 0:2])
+
+        out = keypoints_with_scores.copy()
+        out[0, 0, :, :] = kps
+        return out
+
+    def _push_history(self, yx):
+        self._hist.append(yx.copy())
+        if len(self._hist) > self._hist_len:
+            self._hist.pop(0)
     
-    def apply_smoothing(self, current_keypoints, prev_keypoints):
-        """Deprecated: smoothing disabled; return current keypoints."""
-        return current_keypoints
+    def _apply_torso_constraints(self, yx, prev_yx, conf):
+        """Validate and constrain torso keypoints to maintain realistic body proportions.
+        Checks shoulder-hip relationships to prevent unrealistic configurations."""
+        try:
+            # Keypoint indices: 5=left_shoulder, 6=right_shoulder, 11=left_hip, 12=right_hip
+            left_shoulder, right_shoulder = 5, 6
+            left_hip, right_hip = 11, 12
+            
+            # Check if we have enough confident torso detections
+            torso_indices = [left_shoulder, right_shoulder, left_hip, right_hip]
+            confident_torso = sum([1 for i in torso_indices if conf[i] > 0.10])
+            
+            if confident_torso >= 3:  # Need at least 3 torso points
+                # Calculate shoulder width and hip width
+                shoulder_width = np.linalg.norm(yx[right_shoulder] - yx[left_shoulder])
+                hip_width = np.linalg.norm(yx[right_hip] - yx[left_hip])
+                
+                # Calculate torso height (average shoulder to hip distance)
+                left_torso_height = np.linalg.norm(yx[left_hip] - yx[left_shoulder])
+                right_torso_height = np.linalg.norm(yx[right_hip] - yx[right_shoulder])
+                avg_torso_height = (left_torso_height + right_torso_height) / 2.0
+                
+                # Realistic body proportion checks
+                # 1. Shoulder width should be 20-50% of torso height
+                # 2. Hip width should be 20-50% of torso height
+                # 3. Shoulder and hip widths should be similar (within 2x of each other)
+                
+                if avg_torso_height > 0.01:  # Avoid division by zero
+                    shoulder_ratio = shoulder_width / avg_torso_height
+                    hip_ratio = hip_width / avg_torso_height
+                    
+                    # If proportions are unrealistic, use previous values
+                    if shoulder_ratio < 0.15 or shoulder_ratio > 0.60:
+                        # Shoulder width unrealistic, revert to previous
+                        if conf[left_shoulder] < 0.25:
+                            yx[left_shoulder] = prev_yx[left_shoulder]
+                        if conf[right_shoulder] < 0.25:
+                            yx[right_shoulder] = prev_yx[right_shoulder]
+                    
+                    if hip_ratio < 0.15 or hip_ratio > 0.60:
+                        # Hip width unrealistic, revert to previous
+                        if conf[left_hip] < 0.25:
+                            yx[left_hip] = prev_yx[left_hip]
+                        if conf[right_hip] < 0.25:
+                            yx[right_hip] = prev_yx[right_hip]
+                    
+                    # Check if shoulder/hip width ratio is reasonable (0.5x to 2x)
+                    if shoulder_width > 0.01 and hip_width > 0.01:
+                        width_ratio = shoulder_width / hip_width
+                        if width_ratio < 0.4 or width_ratio > 2.5:
+                            # Use the more confident pair
+                            shoulder_conf = (conf[left_shoulder] + conf[right_shoulder]) / 2.0
+                            hip_conf = (conf[left_hip] + conf[right_hip]) / 2.0
+                            
+                            if shoulder_conf < hip_conf and shoulder_conf < 0.25:
+                                yx[left_shoulder] = prev_yx[left_shoulder]
+                                yx[right_shoulder] = prev_yx[right_shoulder]
+                            elif hip_conf < shoulder_conf and hip_conf < 0.25:
+                                yx[left_hip] = prev_yx[left_hip]
+                                yx[right_hip] = prev_yx[right_hip]
+            
+            return yx
+        except Exception:
+            # If any error occurs, return unmodified
+            return yx
+
+    def _apply_outlier_guard(self, yx, prev_yx, keypoints_with_scores):
+        """Strict outlier detection to prevent jitter from noisy MoveNet detections."""
+        try:
+            # Get confidence scores
+            conf = keypoints_with_scores[0, 0, :, 2]
+            
+            # Normalized per-frame movement cap
+            pixel_cap_norm = float(self._pixel_step_frac)
+
+            # Strict MAD-based outlier detection with sufficient history
+            if len(self._hist) >= 4:  # Need less history for faster response
+                hist_stack = np.stack(self._hist, axis=0)  # (T,17,2)
+                med = np.median(hist_stack, axis=0)
+                mad = np.median(np.abs(hist_stack - med), axis=0) + 1e-6
+                
+                diff = yx - med
+                
+                # Apply strict MAD filtering
+                for i in range(17):
+                    deviation = np.abs(diff[i]) / mad[i]
+                    
+                    # If deviation is extreme and confidence is not very high, clamp it
+                    if np.any(deviation > self._mad_k):
+                        if conf[i] < 0.65:  # Lowered from 0.7 for more responsiveness
+                            # Clamp to MAD boundary
+                            yx[i] = med[i] + np.sign(diff[i]) * np.minimum(np.abs(diff[i]), self._mad_k * mad[i])
+
+            # Per-frame step clamp - stricter for low confidence
+            delta = yx - prev_yx
+            for i in range(17):
+                # Scale cap based on confidence
+                if conf[i] > 0.65:
+                    cap = pixel_cap_norm * 4.0  # Allow large movement for high confidence
+                elif conf[i] > 0.45:
+                    cap = pixel_cap_norm * 2.0  # Moderate movement for medium confidence
+                else:
+                    cap = pixel_cap_norm * 0.6  # Restrictive for low confidence (likely noise)
+                
+                delta[i] = np.clip(delta[i], -cap, cap)
+            
+            yx = prev_yx + delta
+            return yx
+        except Exception:
+            return yx
     
     def process_frame(self, frame, show_feedback=True):
         """Process a single frame and return the result."""
         # Convert BGR to RGB for model input
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Remember frame shape for outlier guard pixel clamp
+        self.last_frame_shape = frame.shape
         
         # Resize and pad to model input size
         input_image = tf.expand_dims(image_rgb, axis=0)
         input_image = tf.image.resize_with_pad(input_image, self.input_size, self.input_size)
-
+        
         # Run MoveNet
         keypoints_with_scores = self.movenet(input_image)
 
-        # No temporal smoothing; use raw keypoints per frame
+        # Apply global EMA smoothing to keypoints
+        keypoints_with_scores = self.smooth_keypoints_ema(keypoints_with_scores)
 
         # Get comprehensive feedback if requested
         feedback = None
@@ -81,39 +322,41 @@ class PoseProcessor:
                 keypoints_with_scores, frame.shape[0], frame.shape[1]
             )
 
-        # Determine threshold and visualization method based on feedback
-        if feedback and feedback.get('form_analysis'):
-            # Use enhanced visualization for squat analysis
-            threshold = 0.15
-            use_enhanced = True
-        elif feedback and feedback['distance_status'] in ['very_close', 'close']:
-            threshold = 0.15
-            use_adaptive = True
-            use_enhanced = False
-        else:
-            threshold = 0.2
-            use_adaptive = False
-            use_enhanced = False
+        # Determine exercise mode for visualization routing
+        exercise_mode = getattr(self.feedback, 'exercise_mode', 'squat')
 
-        # Draw prediction with appropriate method
-        if use_enhanced:
-            output_overlay = draw_prediction_on_image_enhanced(
+        # Configure visualization per mode
+        if exercise_mode == 'bench':
+            # Bench press benefits from lower thresholds and relaxed bounds
+            threshold = 0.20
+            output_overlay = draw_prediction_on_image_bench_press(
                 frame.copy(),
                 keypoints_with_scores,
-                keypoint_threshold=threshold
-            )
-        elif use_adaptive:
-            output_overlay = draw_prediction_on_image_adaptive(
-                frame.copy(),
-                keypoints_with_scores,
-                keypoint_threshold=threshold
+                keypoint_threshold=threshold,
             )
         else:
-            output_overlay = draw_prediction_on_image_simple(
-                frame.copy(),
-                keypoints_with_scores,
-                keypoint_threshold=threshold
-            )
+            # Squat/default path: choose based on feedback richness
+            if feedback and feedback.get('form_analysis'):
+                threshold = 0.22  # Reduced from 0.25 for better torso tracking
+                output_overlay = draw_prediction_on_image_enhanced(
+                    frame.copy(),
+                    keypoints_with_scores,
+                    keypoint_threshold=threshold,
+                )
+            elif feedback and feedback['distance_status'] in ['very_close', 'close']:
+                threshold = 0.22  # Reduced from 0.25 for better torso tracking
+                output_overlay = draw_prediction_on_image_adaptive(
+                    frame.copy(),
+                    keypoints_with_scores,
+                    keypoint_threshold=threshold,
+                )
+            else:
+                threshold = 0.25  # Reduced from 0.30 for better torso tracking
+                output_overlay = draw_prediction_on_image_simple(
+                    frame.copy(),
+                    keypoints_with_scores,
+                    keypoint_threshold=threshold,
+                )
 
         # Add comprehensive feedback overlay if requested
         if show_feedback and feedback:
@@ -206,101 +449,12 @@ def process_video_with_squat_analysis(video_path, movenet_model, input_size, out
         process_step = 1
         effective_output_fps = fps if fps and fps > 0 else 30
 
-    # Setup video writer if output path is provided
-    writer = None
-    if output_path:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(output_path, fourcc, effective_output_fps, (out_w, out_h))
-        print(f"Output will be saved to: {output_path}")
+    # Output video writing is now handled in main.py
     
-    frame_count = 0
-    
-    print("Processing video... Press 'q' to stop early.")
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            frame_count += 1
-            if frame_count % 30 == 0:
-                progress = (frame_count / total_frames) * 100
-                print(f"Progress: {progress:.1f}% ({frame_count}/{total_frames})")
-            
-            # Process frame in original orientation - keep the same orientation as input
-            # Apply counter-rotation if needed to restore original portrait orientation
-            if 'needs_counter_rotation' in locals() and needs_counter_rotation:
-                # Counter-rotate the frame back to portrait (rotate 90 degrees clockwise)
-                pose_detection_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-                if frame_count <= 3:
-                    print(f"Applied counter-rotation to frame {frame_count}")
-            else:
-                pose_detection_frame = frame
-            
-            # Debug: Print frame dimensions for first few frames
-            if frame_count <= 3:
-                frame_h, frame_w = frame.shape[:2]
-                print(f"Frame {frame_count} dimensions: {frame_w}x{frame_h}")
-                if 'needs_counter_rotation' in locals() and needs_counter_rotation:
-                    rotated_h, rotated_w = pose_detection_frame.shape[:2]
-                    print(f"After counter-rotation: {rotated_w}x{rotated_h}")
-            
-            # Skip frames to cap processing rate to <= 60 FPS
-            if (frame_count - 1) % process_step != 0:
-                # Even if skipping processing, still allow early quit
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    print("Processing stopped by user.")
-                    break
-                continue
-
-            # Process frame for pose detection - real-time processing
-            output_overlay, keypoints_with_scores, feedback = processor.process_frame(pose_detection_frame, show_feedback=True)
-            
-            # Apply counter-rotation to output if needed
-            if 'needs_counter_rotation' in locals() and needs_counter_rotation:
-                # The output_overlay is already processed with the rotated frame, so no additional rotation needed
-                pass
-            
-            # Display the result in a window that adapts to video dimensions
-            cv2.namedWindow('MoveNet Lightning - Squat Analysis', cv2.WINDOW_NORMAL)
-            
-            # Calculate display window size based on video dimensions
-            # Limit max size to fit on screen while maintaining aspect ratio
-            max_width, max_height = 1920, 1080  # Max display size
-            display_w, display_h = out_w, out_h
-            
-            # Scale down if video is too large
-            if display_w > max_width or display_h > max_height:
-                scale = min(max_width / display_w, max_height / display_h)
-                display_w = int(display_w * scale)
-                display_h = int(display_h * scale)
-            
-            cv2.resizeWindow('MoveNet Lightning - Squat Analysis', display_w, display_h)
-            cv2.imshow('MoveNet Lightning - Squat Analysis', output_overlay)
-            
-            if writer:
-                # Ensure output frame matches video writer dimensions to prevent black bars
-                if output_overlay.shape[:2] != (out_h, out_w):
-                    # If counter-rotation was applied, we need to rotate the output back to match video writer
-                    if 'needs_counter_rotation' in locals() and needs_counter_rotation:
-                        # Rotate back to original orientation to match video writer dimensions
-                        output_overlay = cv2.rotate(output_overlay, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                    else:
-                        # Just resize to match dimensions
-                        output_overlay = cv2.resize(output_overlay, (out_w, out_h))
-                writer.write(output_overlay)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("Processing stopped by user.")
-                break
-                
-    finally:
-        cap.release()
-        if writer:
-            writer.release()
-        cv2.destroyAllWindows()
-        print("Video processing completed!")
+    # This function should only process and return frames, not handle output
+    # (Implementation of frame processing loop should be refactored to main.py)
+    # For now, raise NotImplementedError to indicate this responsibility has moved
+    raise NotImplementedError("Video output and display logic should be handled in main.py, not pose_processor.py.")
 
 def process_webcam_with_squat_analysis(movenet_model, input_size):
     """Process webcam feed with comprehensive squat form analysis - no temporal interpolation."""
@@ -356,4 +510,4 @@ def process_video_with_improved_feedback(video_path, movenet_model, input_size, 
 
 def process_webcam_with_improved_feedback(movenet_model, input_size):
     """Process webcam feed with improved feedback system (legacy function)."""
-    return process_webcam_with_squat_analysis(movenet_model, input_size) 
+    return process_webcam_with_squat_analysis(movenet_model, input_size)
