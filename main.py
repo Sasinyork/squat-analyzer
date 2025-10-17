@@ -146,13 +146,13 @@ def analyze_video_with_orientation(video_path="data/bench/bench.mp4", exercise_m
                     font_scale = 0.7
                 
                 # Add frame info
-                cv2.putText(output_overlay, f"Frame: {frame_count}", (info_x, info_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2)
+                # cv2.putText(output_overlay, f"Frame: {frame_count}", (info_x, info_y), 
+                #            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2)
                 
-                # Add mode indicator
-                mode_text = f"Mode: {processor.feedback.exercise_mode.upper()}"
-                cv2.putText(output_overlay, mode_text, (mode_x, mode_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), 2)
+                # # Add mode indicator
+                # mode_text = f"Mode: {processor.feedback.exercise_mode.upper()}"
+                # cv2.putText(output_overlay, mode_text, (mode_x, mode_y), 
+                #            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), 2)
                 
                 # Save to output video if enabled
                 if out:
