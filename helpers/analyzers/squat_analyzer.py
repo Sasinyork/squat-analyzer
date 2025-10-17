@@ -11,14 +11,31 @@ class SquatFormAnalyzer:
         self.phase_frames = 0
         self.form_issues = []
         self.feedback_history = []
-        
+
+        # Rep counting state
+        self.rep_count = 0
+        self.correct_rep_count = 0
+        self.incorrect_rep_count = 0
+        self._rep_state = {
+            'in_rep': False,
+            'bottom_reached': False,
+            'issues_at_bottom': [],
+        }
+        self._last_bottom_issues = []  # Store issues at last bottom phase for rep correctness
+        # Rep counting by phase sequence
+        self._phase_queue = []  # Track last N phases
+        self._max_phase_queue = 5
+        self._last_phase = None
+
         # Phase detection parameters
         self.hip_positions = []  # Store recent hip positions for movement detection
         self.max_history = 10  # Number of frames to track for movement
         self.movement_threshold = 5  # Minimum pixel movement to detect direction
         self.standing_threshold = -50  # Hip must be this much above knee to be "standing" (negative in image coords)
         self.bottom_threshold = -50  # Hip must be close to knee level to be "bottom" (more inclusive for depth analysis)
-        
+        self._bottom_cooldown = 0  # Prevent repeated bottom phase triggers
+        self._bottom_cooldown_frames = 8  # Number of frames to wait before allowing bottom again
+
         # Keypoint indices for MoveNet
         self.NOSE = 0
         self.LEFT_SHOULDER = 5
@@ -91,71 +108,68 @@ class SquatFormAnalyzer:
         right_knee = self.get_keypoint_coords(keypoints, self.RIGHT_KNEE, image_height, image_width)
         
         if left_hip and right_hip and left_knee and right_knee:
-            # Calculate average hip and knee positions
             hip_y = (left_hip[1] + right_hip[1]) / 2
             knee_y = (left_knee[1] + right_knee[1]) / 2
-            
-            # Calculate relative position (hip should be above knee in standing)
             hip_knee_diff = hip_y - knee_y
-            
-            # Update hip position history for movement detection
+
             self.hip_positions.append(hip_y)
             if len(self.hip_positions) > self.max_history:
                 self.hip_positions.pop(0)
-            
-            # Detect movement direction
+
             movement_direction = self.detect_movement_direction(hip_y)
-            
-            # Determine phase based on position AND movement
-            # Additional rule: treat the local minimum of the hip trajectory as bottom (brief pause),
-            # even if depth is above parallel. This is robust to shallower reps.
-            is_local_min_bottom = False
-            recent_positions = self.hip_positions[-5:] if len(self.hip_positions) >= 3 else self.hip_positions
-            if len(recent_positions) >= 3:
-                max_recent = max(recent_positions)
-                # Consider within 6 pixels of the recent maximum (lowest point in image coords) as bottom
-                if abs(hip_y - max_recent) <= 6:
-                    # And only when movement is stable or direction is changing
-                    if movement_direction in ("stable",) or (len(self.hip_positions) >= 3 and recent_positions[-1] <= recent_positions[-2]):
-                        is_local_min_bottom = True
 
-            # Standing: Hip well above knee (negative difference in image coords)
-            if hip_knee_diff < self.standing_threshold and not is_local_min_bottom:
-                if movement_direction == "stable":
-                    new_phase = "standing"
-                elif movement_direction == "descending":
+            # FSM logic without setup state
+            prev_phase = self.squat_phase
+            new_phase = prev_phase
+
+            min_descend_frames = 5
+            min_ascend_frames = 10
+
+            if hip_knee_diff < self.standing_threshold and movement_direction == "stable":
+                # If user is clearly standing, force phase to standing
+                new_phase = "standing"
+            elif prev_phase == "standing":
+                # Only start descent if hip drops and movement is clear
+                if movement_direction == "descending" and hip_knee_diff > self.standing_threshold + 10:
+                    new_phase = "descending"
+            elif prev_phase == "descending":
+                if self.phase_frames < min_descend_frames:
                     new_phase = "descending"
                 else:
-                    new_phase = "standing"  # Default to standing if unclear
-
-            # Bottom: Either hip near/below knee OR local minimum detected
-            elif hip_knee_diff > self.bottom_threshold or is_local_min_bottom:
-                if movement_direction == "ascending" and not is_local_min_bottom:
+                    if hip_knee_diff > self.bottom_threshold and movement_direction in ["stable", "ascending"]:
+                        new_phase = "bottom"
+                    elif movement_direction == "ascending":
+                        new_phase = "ascending"
+                    else:
+                        new_phase = "descending"
+            elif prev_phase == "bottom":
+                if movement_direction == "ascending" and hip_knee_diff < self.bottom_threshold:
+                    new_phase = "ascending"
+            elif prev_phase == "ascending":
+                if self.phase_frames < min_ascend_frames:
                     new_phase = "ascending"
                 else:
-                    new_phase = "bottom"
+                    if hip_knee_diff < self.standing_threshold and movement_direction == "stable":
+                        new_phase = "standing"
+                    elif hip_knee_diff > self.bottom_threshold and movement_direction == "descending":
+                        new_phase = "descending"
+                    else:
+                        new_phase = "ascending"
 
-            # Transition zone: Between standing and bottom
-            else:
-                if movement_direction == "descending":
+            if new_phase == prev_phase:
+                if movement_direction == "descending" and prev_phase != "descending":
                     new_phase = "descending"
-                elif movement_direction == "ascending":
+                elif movement_direction == "ascending" and prev_phase != "ascending":
                     new_phase = "ascending"
-                elif hip_knee_diff > 0:  # Hip below knee (positive in image coords)
-                    new_phase = "bottom"
-                else:  # Hip above knee but not high enough for standing
-                    new_phase = "descending"  # Still going down
-            
-            # Update phase tracking
-            if new_phase == self.squat_phase:
+
+            if new_phase == prev_phase:
                 self.phase_frames += 1
             else:
                 self.squat_phase = new_phase
                 self.phase_frames = 0
-            
+
             return new_phase, hip_knee_diff
-        
-        return "unknown", 0
+        return self.squat_phase, 0
     
     def detect_view_angle(self, keypoints, image_height, image_width):
         """Detect if the person is viewed from front, side, or angle."""
@@ -382,34 +396,78 @@ class SquatFormAnalyzer:
     
     def analyze_squat_form(self, keypoints_with_scores, image_height, image_width):
         """Squat form analysis including depth and back rounding."""
+
         keypoints = keypoints_with_scores[0, 0, :, :]
-        
         # Detect squat phase
         phase, depth_metric = self.detect_squat_phase(keypoints, image_height, image_width)
-        
+        # Debug: print only when phase changes
+        # if not hasattr(self, '_last_debug_phase') or self._last_debug_phase != phase:
+            # print(f"[Squat Debug] Current phase: {phase} | Last 5 phases: {self._phase_queue[-5:]}")
+            # self._last_debug_phase = phase
+
         # Only analyze depth during bottom phase or if hip is near knee level
         left_hip = self.get_keypoint_coords(keypoints, self.LEFT_HIP, image_height, image_width)
         right_hip = self.get_keypoint_coords(keypoints, self.RIGHT_HIP, image_height, image_width)
         left_knee = self.get_keypoint_coords(keypoints, self.LEFT_KNEE, image_height, image_width)
         right_knee = self.get_keypoint_coords(keypoints, self.RIGHT_KNEE, image_height, image_width)
-        
+
         # Show depth feedback during bottom phase or when we detect depth issues during descending
         show_depth_feedback = False
         if phase == "bottom":
             show_depth_feedback = True
-        
+
         # Always run analyze_depth/back, but only show depth feedback if show_depth_feedback is True
         depth_issues = self.analyze_depth(keypoints, image_height, image_width)
         back_issues = self.analyze_back_form(keypoints, image_height, image_width)
-        
+
         # If we're descending and have depth issues, show feedback
         if phase == "descending" and depth_issues:
             show_depth_feedback = True
-        
+
         # Merge all detected issues for scoring and recommendations
         all_issues = []
         all_issues.extend(depth_issues)
         all_issues.extend(back_issues)
+
+
+
+        # --- REP COUNTING LOGIC: robust phase sequence method ---
+        # Track last N phases
+        if not self._phase_queue or self._phase_queue[-1] != phase:
+            self._phase_queue.append(phase)
+            if len(self._phase_queue) > self._max_phase_queue:
+                self._phase_queue.pop(0)
+
+        # Store issues at bottom phase for rep correctness
+        if phase == "bottom":
+            self._last_bottom_issues = all_issues.copy()
+
+        # More robust rep detection: allow a single 'stable' or 'unknown' phase in the sequence
+        def matches_expected(seq, expected):
+            if len(seq) != len(expected):
+                return False
+            mismatches = 0
+            for s, e in zip(seq, expected):
+                if s == e:
+                    continue
+                if s in ("stable", "unknown"):
+                    mismatches += 1
+                else:
+                    return False
+            return mismatches <= 1
+
+        expected_seq = ["standing", "descending", "bottom", "ascending", "standing"]
+        if len(self._phase_queue) >= 5 and matches_expected(self._phase_queue[-5:], expected_seq):
+            self.rep_count += 1
+            # Use issues at bottom for correctness
+            is_correct = not any(i.get('severity', 'low') in ('medium', 'high') for i in self._last_bottom_issues)
+            if is_correct:
+                self.correct_rep_count += 1
+            else:
+                self.incorrect_rep_count += 1
+            self._phase_queue = []  # Reset to avoid double-counting
+
+        self._last_phase = phase
 
         feedback = {
             'phase': phase,
@@ -418,9 +476,12 @@ class SquatFormAnalyzer:
             'depth_metric': depth_metric,
             'overall_score': self.calculate_form_score(all_issues),
             'primary_issue': self.get_primary_issue(all_issues),
-            'recommendations': self.get_recommendations(all_issues)
+            'recommendations': self.get_recommendations(all_issues),
+            'rep_count': self.rep_count,
+            'correct_rep_count': self.correct_rep_count,
+            'incorrect_rep_count': self.incorrect_rep_count
         }
-        
+
         if show_depth_feedback:
             if not depth_issues:
                 feedback['depth_status'] = 'good'
@@ -442,7 +503,7 @@ class SquatFormAnalyzer:
         else:
             feedback['back_status'] = 'good'
             feedback['back_message'] = 'Good back position - neutral spine maintained'
-        
+
         self.feedback_history.append(feedback)
         if len(self.feedback_history) > 10:
             self.feedback_history.pop(0)
