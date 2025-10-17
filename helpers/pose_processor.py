@@ -30,8 +30,8 @@ class PoseProcessor:
         self.feedback = PoseFeedback()
 
         # Smoothing options
-        self.spatiotemporal_enabled = False  # Existing smoothing toggle
-        self.kalman_enabled = True  # New Kalman filter toggle
+        self.spatiotemporal_enabled = False  # Spatio temporal smoothing toggle
+        self.kalman_enabled = True  # Kalman filter smoothing toggle
 
         # Pure spatio-temporal smoothing controls
         self.temporal_alpha = 0.22    # more weight to previous for stability
