@@ -354,7 +354,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 pill_height = text_size[1] + vertical_padding * 2
                 extra_height += pill_height + 16
 
-    # Bench mode: reserve space for phase and depth lines
+    # Bench mode: reserve space for phase and depth linesq
     if feedback.get('exercise_mode') == 'bench' and feedback.get('form_analysis'):
         extra_height += 26 * 2  # Phase + Depth lines
     
@@ -367,7 +367,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     
     # Position overlay with margin from bottom and sides
     margin = 5  # Base bottom margin
-    side_margin = min(200, width // 10)
+    side_margin = 0
     bottom_offset = min(int(height * 0.06), 64)
     bg_y_start = max(0, height - text_bg_height - margin - bottom_offset)
 
@@ -377,28 +377,78 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     y1 = bg_y_start
     y2 = min(height - margin - bottom_offset + (height - (bg_y_start + text_bg_height + margin)), height - margin)
 
-    # Draw rep counter at the very top of the image with background
-    if show_reps:
-        rep_font = cv2.FONT_HERSHEY_SIMPLEX
-        rep_font_scale = 1.1
-        rep_thickness = 3
-        rep_size = cv2.getTextSize(rep_text, rep_font, rep_font_scale, rep_thickness)[0]
-        rep_bg_height = rep_size[1] + 24
-        rep_bg_y1 = 0
-        rep_bg_y2 = rep_bg_height
-        rep_bg_x1 = 0
-        rep_bg_x2 = width
-        # Draw background
-        image = draw_rounded_rectangle_with_alpha(image, rep_bg_x1, rep_bg_y1, rep_bg_x2, rep_bg_y2, (0, 0, 0), alpha=0.8, radius=0)
-        # Draw text centered
-        rep_x = (width - rep_size[0]) // 2
-        rep_y = rep_bg_y1 + rep_size[1] + 12
-        cv2.putText(image, rep_text, (rep_x, rep_y), rep_font, rep_font_scale, (255,255,255), rep_thickness)
+    # Draw rep counter as a full-width top bar with three columns (Total Reps, Correct, Incorrect) only if rep counting is active
+    # For squat mode, get rep counts from form_analysis if present
+    rep_count = 0
+    correct_count = 0
+    incorrect_count = 0
+    if feedback.get('exercise_mode') == 'squat' and feedback.get('form_analysis'):
+        fa = feedback['form_analysis']
+        rep_count = fa.get('rep_count', 0)
+        correct_count = fa.get('correct_rep_count', 0)
+        incorrect_count = fa.get('incorrect_rep_count', 0)
+    else:
+        rep_count = feedback.get('rep_count', 0)
+        correct_count = feedback.get('correct_rep_count', 0)
+        incorrect_count = feedback.get('incorrect_rep_count', 0)
+    rep_counter_active = show_reps or (rep_count > 0 or correct_count > 0 or incorrect_count > 0)
+    if rep_counter_active:
+        # Bar background color (dark blue-ish)
+        bar_color = (80, 86, 106)
+        bar_alpha = 0.95
+        bar_height = 120
+        bar_y1 = 0
+        bar_y2 = bar_y1 + bar_height
+        # Draw the full-width bar
+        image = draw_rounded_rectangle_with_alpha(image, 0, bar_y1, width, bar_y2, bar_color, alpha=bar_alpha, radius=0)
+
+        # Column positions
+        col_width = width // 3
+        col_x = [0, col_width, col_width * 2, width]
+        # Colors for text
+        correct_color = (100, 139, 51)
+        incorrect_color = (75, 74, 179)
+        reps_label_color = (200, 180, 180)
+        # Labels
+        labels = ["REPS", "CORRECT", "INCORRECT"]
+        values = [rep_count, correct_count, incorrect_count]
+        label_colors = [reps_label_color, correct_color, incorrect_color]
+
+        # Draw divider lines between columns
+        divider_thickness = 4
+        for i in [1, 2]:
+            x = col_x[i]
+            cv2.line(image, (x, bar_y1 + 12), (x, bar_y2 - 12), (120, 120, 120), divider_thickness)
+
+        # Draw each column: label (top, centered), value (below, centered)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        label_font_scale = 0.9
+        label_thickness = 4
+        value_font_scale = 1.2
+        value_thickness = 6
+        for i in range(3):
+            # Center of this column
+            center_x = (col_x[i] + col_x[i+1]) // 2
+            # Draw label (allow for two lines for TOTAL REPS)
+            label = labels[i]
+            label_lines = label.split("\n")
+            # Draw each line of label
+            for j, line in enumerate(label_lines):
+                label_size = cv2.getTextSize(line, font, label_font_scale, label_thickness)[0]
+                label_x = center_x - label_size[0] // 2
+                label_y = bar_y1 + 42 + j * (label_size[1] + 2)
+                cv2.putText(image, line, (label_x, label_y), font, label_font_scale, label_colors[i], label_thickness, cv2.LINE_AA)
+            # Draw value (below label, centered)
+            value_str = str(values[i])
+            value_size = cv2.getTextSize(value_str, font, value_font_scale, value_thickness)[0]
+            value_x = center_x - value_size[0] // 2
+            value_y = bar_y1 + 78 + value_size[1] // 2
+            cv2.putText(image, value_str, (value_x, value_y), font, value_font_scale, (255, 255, 255), value_thickness, cv2.LINE_AA)
     
     # Only draw if we have a valid rectangle
     if x1 < x2 and y1 < y2:
         # Draw rounded rectangle background with alpha transparency
-        image = draw_rounded_rectangle_with_alpha(image, x1, y1, x2, y2, (0, 0, 0), alpha=0.7, radius=10)
+        image = draw_rounded_rectangle_with_alpha(image, x1, y1, x2, y2, (80, 86, 106), alpha=0.7, radius=10)
         
 
         # Draw rep counter if enabled (at the top of overlay)
@@ -406,141 +456,116 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         font_scale = 0.95
         thickness = 2
         y_offset = 20
-        # Draw phase if available (above main feedback)
-        if phase_text:
-            phase_size = cv2.getTextSize(phase_text, font, font_scale, thickness)[0]
-            phase_x = ((width - side_margin * 2) - phase_size[0]) // 2 + side_margin
-            phase_y = bg_y_start + y_offset
-            cv2.putText(image, phase_text, (phase_x, phase_y), font, font_scale, (200,255,200), thickness)
-            y_offset += 28
+        # Draw phase only as a feedback line with background (handled below)
+        # Remove duplicate phase display here
 
     # Draw main feedback message
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 1.1  # Increased font size for better visibility
-    thickness = 3
-    text_size = cv2.getTextSize(feedback['message'], font, font_scale, thickness)[0]
-    text_x = ((width - side_margin * 2) - text_size[0]) // 2 + side_margin
-    text_y = bg_y_start + y_offset
-    cv2.putText(image, feedback['message'], (text_x, text_y), font, font_scale, feedback['color'], thickness)
-        
-        # Draw form analysis if available (compact)
+    # Only draw if we have a valid rectangle
+    if x1 < x2 and y1 < y2:
+        # Draw rounded rectangle background with alpha transparency
+        image = draw_rounded_rectangle_with_alpha(image, x1, y1, x2, y2, (80, 86, 106), alpha=0.7, radius=10)
+
+        # Prepare all feedback lines to display
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale_main = 1.1  # Increased font size for main message
+        font_scale_secondary = 1.1  # For secondary lines
+        font_scale_small = 0.95
+        thickness_main = 2
+        thickness_secondary = 2
+        thickness_small = 2
+    y_offset = 36
+    line_spacing = 18
+    block_spacing = 34  # Increased gap between feedback lines
+    lines = []
+    bg_colors = []
+    text_colors = []
+
+    # Phase line (if present)
+    if phase_text:
+        lines.append(phase_text)
+        bg_colors.append((30, 60, 30))
+        text_colors.append((200,255,200))
+    # Main feedback message
+    if feedback['message']:
+        lines.append(feedback['message'])
+        bg_colors.append(feedback['color'])
+        text_colors.append((0,0,0) if sum(feedback['color']) > 500 else (255,255,255))
+
+    # Form analysis lines
     if feedback.get('form_analysis'):
-            form_analysis = feedback['form_analysis']
-            if feedback.get('exercise_mode') == 'deadlift':
-                # Collect all actionable recommendations for deadlift (hip, knee, spine)
-                recs = []
-                # Hip extension
-                if form_analysis.get('hip_extension_status') == 'needs_improvement' and form_analysis.get('hip_extension_message'):
-                    recs.append((form_analysis['hip_extension_message'], (0, 165, 255)))
-                # Knee issues
-                for issue in form_analysis.get('knee_issues', []):
-                    if 'recommendation' in issue:
-                        color = (0, 165, 255) if issue['severity'] in ('medium', 'high') else (0, 255, 0)
-                        recs.append((issue['recommendation'], color))
-                # Spine/torso issues
-                for issue in form_analysis.get('spine_issues', []):
-                    if 'recommendation' in issue:
-                        color = (0, 165, 255) if issue['severity'] in ('medium', 'high') else (0, 255, 0)
-                        recs.append((issue['recommendation'], color))
-                # Draw each recommendation line
-                for i, (text, color) in enumerate(recs):
-                    if len(text) > 60:
-                        text = text[:57] + "..."
-                    size = cv2.getTextSize(text, font, 0.9, 2)[0]
-                    x = ((width - side_margin * 2) - size[0]) // 2 + side_margin
-                    y = bg_y_start + 45 + i * 26
-                    cv2.putText(image, text, (x, y), font, 0.9, color, 2)
-            else:
-                # Show both back and depth messages, back first if present (squat)
-                lines_to_show = []
-                if form_analysis.get('back_message') and form_analysis.get('back_status'):
-                    back_color = (0, 255, 0) if form_analysis['back_status'] == 'good' else (0, 165, 255)
-                    lines_to_show.append((form_analysis['back_message'], back_color))
-                if form_analysis.get('depth_message') and form_analysis.get('depth_status'):
-                    if form_analysis['depth_status'] == 'good':
-                        depth_color = (0, 255, 0)
-                    elif form_analysis['depth_status'] == 'needs_improvement':
-                        depth_color = (0, 165, 255)
-                    else:
-                        depth_color = (255, 255, 255)
-                    lines_to_show.append((form_analysis['depth_message'], depth_color))
-                for i, (text, color) in enumerate(lines_to_show[:2]):
-                    if len(text) > 45:
-                        text = text[:42] + "..."
-                    size = cv2.getTextSize(text, font, 0.9, 2)[0]
-                    x = ((width - side_margin * 2) - size[0]) // 2 + side_margin
-                    y = bg_y_start + 45 + i * 26
-                    cv2.putText(image, text, (x, y), font, 0.9, color, 2)
-                # Show recommendation below depth message if available
-                if form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0:
-                    recommendation_text = form_analysis['recommendations'][0]
-                    max_chars_per_line = 65
-                    if len(recommendation_text) > max_chars_per_line:
-                        lines = []
-                        words = recommendation_text.split()
-                        current_line = ""
-                        for word in words:
-                            if len(current_line + " " + word) <= max_chars_per_line:
-                                current_line += (" " + word) if current_line else word
-                            else:
-                                if current_line:
-                                    lines.append(current_line)
-                                current_line = word
-                        if current_line:
-                            lines.append(current_line)
-                    else:
-                        lines = [recommendation_text]
-                    line_height = 24
-                    start_y = bg_y_start + 45 + (len(lines_to_show[:2]) * 26) + 20
-                    for i, line in enumerate(lines):
-                        line_size = cv2.getTextSize(line, font, 0.75, 2)[0]
-                        line_x = ((width - side_margin * 2) - line_size[0]) // 2 + side_margin
-                        line_y = start_y + (i * line_height)
-                        recommendation_color = (255, 255, 0)
-                        cv2.putText(image, line, (line_x, line_y), font, 0.75, recommendation_color, 2)
-            
-            # Add good/bad form indicator only for squat at bottom
-            if feedback.get('exercise_mode') != 'bench':
-                # Good/bad indicator is GOOD only when depth is good AND back is good
-                depth_good = form_analysis.get('depth_status') == 'good'
-                back_good = form_analysis.get('back_status') == 'good'
-                has_any_status = form_analysis.get('depth_status') is not None or form_analysis.get('back_status') is not None
-                # Only show the GOOD/INCORRECT pill at the bottom of the squat
-                phase_is_bottom = form_analysis.get('phase') == 'bottom'
-                if phase_is_bottom and has_any_status:
-                    is_good = depth_good and back_good
-                    pill_color = (0, 255, 0) if is_good else (255, 0, 0)
-                    label = 'CORRECT FORM' if is_good else 'INCORRECT FORM'
+        form_analysis = feedback['form_analysis']
+        # For squat and deadlift, only show the referenced feedback (back_message/depth_message), not the recommendations list
+        def wrap_text(text, font, scale, thickness, max_width):
+            words = text.split()
+            lines = []
+            current_line = ''
+            for word in words:
+                test_line = f'{current_line} {word}'.strip()
+                size = cv2.getTextSize(test_line, font, scale, thickness)[0]
+                if size[0] <= max_width:
+                    current_line = test_line
+                else:
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = word
+            if current_line:
+                lines.append(current_line)
+            return lines
 
-                    # Compute pill dimensions based on text size
-                    pill_font = cv2.FONT_HERSHEY_SIMPLEX
-                    pill_scale = 0.9
-                    pill_thickness = 2
-                    text_size = cv2.getTextSize(label, pill_font, pill_scale, pill_thickness)[0]
-                    horizontal_padding = 22
-                    vertical_padding = 8
-                    pill_width = text_size[0] + horizontal_padding * 2
-                    pill_height = text_size[1] + vertical_padding * 2
+        max_text_width = x2 - x1 - 64  # leave some margin inside the box
+        if feedback.get('exercise_mode') in ('squat', 'deadlift'):
+            if form_analysis.get('back_message') and form_analysis.get('back_status'):
+                back_color = (0, 255, 0) if form_analysis['back_status'] == 'good' else (0, 165, 255)
+                wrapped = wrap_text(form_analysis['back_message'], font, font_scale_secondary, thickness_secondary, max_text_width)
+                for wline in wrapped:
+                    lines.append(wline)
+                    bg_colors.append((40,40,40))
+                    text_colors.append(back_color)
+            if form_analysis.get('depth_message') and form_analysis.get('depth_status'):
+                if form_analysis['depth_status'] == 'good':
+                    depth_color = (0, 255, 0)
+                elif form_analysis['depth_status'] == 'needs_improvement':
+                    depth_color = (0, 165, 255)
+                else:
+                    depth_color = (255, 255, 255)
+                wrapped = wrap_text(form_analysis['depth_message'], font, font_scale_secondary, thickness_secondary, max_text_width)
+                for wline in wrapped:
+                    lines.append(wline)
+                    bg_colors.append((40,40,40))
+                    text_colors.append(depth_color)
+        else:
+            # For bench or other exercises, keep existing logic if needed
+            pass
 
-                    # Position centered at the very bottom inside the overlay box
-                    available_width = x2 - x1
-                    pill_x1 = x1 + max(10, (available_width - pill_width) // 2)
-                    pill_x2 = pill_x1 + pill_width
-                    pill_y2 = y2 - 10
-                    pill_y1 = pill_y2 - pill_height
+    # Draw each feedback line with its own background, evenly spaced
+    current_y = bg_y_start + y_offset
+    for i, (text, bg_color, text_color) in enumerate(zip(lines, bg_colors, text_colors)):
+        # Choose font size for each line
+        if i == 0 and phase_text:
+            scale = font_scale_secondary
+            thick = thickness_secondary
+        elif i == 0 or (i == 1 and phase_text):
+            scale = font_scale_main
+            thick = thickness_main
+        else:
+            scale = font_scale_secondary
+            thick = thickness_secondary
+        text_size = cv2.getTextSize(text, font, scale, thick)[0]
+        pad_x = 32
+        pad_y = 16  # Slightly more vertical padding
+        rect_x1 = x1 + 16
+        rect_x2 = x2 - 16
+        rect_y1 = current_y - text_size[1] - pad_y//2
+        rect_y2 = current_y + pad_y + 4
+        # Draw background for this line
+        image = draw_rounded_rectangle_with_alpha(image, rect_x1, rect_y1, rect_x2, rect_y2, bg_color, alpha=0.85, radius=12)
+        # Draw text centered
+        text_x = (rect_x1 + rect_x2 - text_size[0]) // 2
+        text_y = current_y + pad_y//2
+        cv2.putText(image, text, (text_x, text_y), font, scale, text_color, thick)
+        current_y = rect_y2 + block_spacing
 
-                    # Draw rounded pill inside the box
-                    image = draw_rounded_rectangle_with_alpha(image, pill_x1, pill_y1, pill_x2, pill_y2, pill_color, alpha=0.95, radius=12)
+        # (Removed: correct/incorrect form indicator at the bottom)
 
-                    # Draw label centered in pill
-                    text_x = pill_x1 + (pill_width - text_size[0]) // 2
-                    text_y = pill_y1 + (pill_height + text_size[1]) // 2
-                    text_color = (0, 0, 0) if is_good else (255, 255, 255)
-                    cv2.putText(image, label, (text_x, text_y), pill_font, pill_scale, text_color, pill_thickness)
-    
     return image
-
-# Keep the old function for backward compatibility
-def draw_feedback_overlay(image, feedback):
-    """Draw positioning feedback on the image (legacy function)."""
-    return draw_comprehensive_feedback_overlay(image, feedback) 
