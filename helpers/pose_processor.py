@@ -314,183 +314,6 @@ class PoseProcessor:
             return out
         except Exception:
             return keypoints_with_scores
-        if self._kalman_filters is None:
-            self._init_kalman_filters(kps)
-        conf = kps[:, 2].copy()
-        # Keypoint indices for elbows and wrists (arms):
-        # 5 = left shoulder, 6 = right shoulder
-        # 7 = left elbow, 8 = right elbow, 9 = left wrist, 10 = right wrist
-        arm_indices = [7, 8, 9, 10]
-        # Clamp downward motion of hands: wrist y cannot go below (greater y than) its corresponding elbow
-        # 9 = left wrist, 10 = right wrist; 7 = left elbow, 8 = right elbow
-        # Only apply to wrists
-        left_elbow_y = kps[7, 0]
-        right_elbow_y = kps[8, 0]
-        # If wrist y > elbow y (i.e., below in image), clamp to elbow y
-        if kps[9, 0] > left_elbow_y:
-            kps[9, 0] = left_elbow_y
-        if kps[10, 0] > right_elbow_y:
-            kps[10, 0] = right_elbow_y
-
-        # Clamp wrist x so it cannot cross to the opposite side of the elbow (relative to previous forearm direction)
-        # Left arm
-        prev_left_elbow_x = self._kalman_filters[7]['y']  # x is index 1, but Kalman filter uses y for x
-        prev_left_wrist_x = self._kalman_filters[9]['y']
-        curr_left_elbow_x = kps[7, 1]
-        curr_left_wrist_x = kps[9, 1]
-        prev_left_dir = np.sign(prev_left_wrist_x - prev_left_elbow_x)
-        curr_left_dir = np.sign(curr_left_wrist_x - curr_left_elbow_x)
-        if prev_left_dir != 0 and curr_left_dir != 0 and prev_left_dir != curr_left_dir:
-            # Clamp wrist x to elbow x
-            kps[9, 1] = curr_left_elbow_x
-
-        # Right arm
-        prev_right_elbow_x = self._kalman_filters[8]['y']
-        prev_right_wrist_x = self._kalman_filters[10]['y']
-        curr_right_elbow_x = kps[8, 1]
-        curr_right_wrist_x = kps[10, 1]
-        prev_right_dir = np.sign(prev_right_wrist_x - prev_right_elbow_x)
-        curr_right_dir = np.sign(curr_right_wrist_x - curr_right_elbow_x)
-        if prev_right_dir != 0 and curr_right_dir != 0 and prev_right_dir != curr_right_dir:
-            kps[10, 1] = curr_right_elbow_x
-        shoulder_indices = [5, 6]
-        # Detect squat bottom: use hips and knees vertical proximity as a proxy
-        # 11 = left hip, 12 = right hip, 13 = left knee, 14 = right knee
-        hips = kps[[11, 12], 1]
-        knees = kps[[13, 14], 1]
-        # If both knees are close to hips vertically (y), likely at bottom
-        squat_bottom = np.all(np.abs(hips - knees) < 0.08)
-        # --- Arm mirroring logic for occluded side ---
-        # Determine which arm is visible (higher average confidence)
-        left_arm_conf = (conf[7] + conf[9]) / 2.0
-        right_arm_conf = (conf[8] + conf[10]) / 2.0
-        # If one arm is much more visible than the other, mirror the occluded arm
-        mirror_threshold = 0.18  # If confidence is below this, treat as occluded
-        # Compute offsets for both arms relative to their shoulders
-        prev_sh_x = [self._kalman_filters[5]['x'], self._kalman_filters[6]['x']]
-        prev_sh_y = [self._kalman_filters[5]['y'], self._kalman_filters[6]['y']]
-        prev_arm_x = [self._kalman_filters[7]['x'], self._kalman_filters[8]['x']]
-        prev_arm_y = [self._kalman_filters[7]['y'], self._kalman_filters[8]['y']]
-        prev_wrist_x = [self._kalman_filters[9]['x'], self._kalman_filters[10]['x']]
-        prev_wrist_y = [self._kalman_filters[9]['y'], self._kalman_filters[10]['y']]
-        left_elbow_offset = [prev_arm_x[0] - prev_sh_x[0], prev_arm_y[0] - prev_sh_y[0]]
-        right_elbow_offset = [prev_arm_x[1] - prev_sh_x[1], prev_arm_y[1] - prev_sh_y[1]]
-        left_wrist_offset = [prev_wrist_x[0] - prev_sh_x[0], prev_wrist_y[0] - prev_sh_y[0]]
-        right_wrist_offset = [prev_wrist_x[1] - prev_sh_x[1], prev_wrist_y[1] - prev_sh_y[1]]
-
-        # --- Collision soft-correction logic ---
-        # If arm and knee are very close and either has low confidence, blend current and previous positions
-        freeze_thresh = 0.045  # normalized distance for collision
-        prev_pos = {idx: (self._kalman_filters[idx]['x'], self._kalman_filters[idx]['y']) for idx in [7,8,9,10,13,14]}
-        for i in range(17):
-            x, y = kps[i, 0], kps[i, 1]
-            c = conf[i]
-            predict_arm = False
-            # Check left side collision
-            left_elbow_dist = np.linalg.norm(kps[7, :2] - kps[13, :2])
-            left_wrist_dist = np.linalg.norm(kps[9, :2] - kps[13, :2])
-            if (left_elbow_dist < freeze_thresh or left_wrist_dist < freeze_thresh):
-                if conf[7] < 0.25 or conf[9] < 0.25 or conf[13] < 0.25:
-                    if i in [7, 9]:
-                        predict_arm = True
-            # Check right side collision
-            right_elbow_dist = np.linalg.norm(kps[8, :2] - kps[14, :2])
-            right_wrist_dist = np.linalg.norm(kps[10, :2] - kps[14, :2])
-            if (right_elbow_dist < freeze_thresh or right_wrist_dist < freeze_thresh):
-                if conf[8] < 0.25 or conf[10] < 0.25 or conf[14] < 0.25:
-                    if i in [8, 10]:
-                        predict_arm = True
-            if predict_arm:
-                # Predict arm position using previous offset from shoulder
-                if i in [7, 9]:  # left arm
-                    sh_idx = 5
-                else:  # right arm
-                    sh_idx = 6
-                prev_sh_x = self._kalman_filters[sh_idx]['x']
-                prev_sh_y = self._kalman_filters[sh_idx]['y']
-                prev_arm_x = self._kalman_filters[i]['x']
-                prev_arm_y = self._kalman_filters[i]['y']
-                offset_x = prev_arm_x - prev_sh_x
-                offset_y = prev_arm_y - prev_sh_y
-                # Predict new position as shoulder + previous offset
-                xk = kps[sh_idx, 0] + offset_x
-                yk = kps[sh_idx, 1] + offset_y
-                # Blend with previous for smoothness
-                xk = 0.7 * xk + 0.3 * prev_arm_x
-                yk = 0.7 * yk + 0.3 * prev_arm_y
-                kps[i, 0] = xk
-                kps[i, 1] = yk
-                continue
-            if i in arm_indices:
-                # Always mirror the occluded arm to the visible arm if confidence is very low
-                if (left_arm_conf > right_arm_conf + 0.10) and (right_arm_conf < mirror_threshold) and (i in [8, 10]):
-                    # Mirror left arm to right arm
-                    sh_x = self._kalman_filters[6]['x']
-                    sh_y = self._kalman_filters[6]['y']
-                    if i == 8:
-                        # Right elbow
-                        xk = sh_x + left_elbow_offset[0]
-                        yk = sh_y + left_elbow_offset[1]
-                    else:
-                        # Right wrist
-                        xk = sh_x + left_wrist_offset[0]
-                        yk = sh_y + left_wrist_offset[1]
-                    kps[i, 0] = xk
-                    kps[i, 1] = yk
-                    continue
-                elif (right_arm_conf > left_arm_conf + 0.10) and (left_arm_conf < mirror_threshold) and (i in [7, 9]):
-                    # Mirror right arm to left arm
-                    sh_x = self._kalman_filters[5]['x']
-                    sh_y = self._kalman_filters[5]['y']
-                    if i == 7:
-                        # Left elbow
-                        xk = sh_x + right_elbow_offset[0]
-                        yk = sh_y + right_elbow_offset[1]
-                    else:
-                        # Left wrist
-                        xk = sh_x + right_wrist_offset[0]
-                        yk = sh_y + right_wrist_offset[1]
-                    kps[i, 0] = xk
-                    kps[i, 1] = yk
-                    continue
-                # At squat bottom and low confidence: freeze arm relative to shoulder
-                if squat_bottom and c < 0.35:
-                    if i in [7, 9]:  # left arm
-                        sh_idx = 5
-                    else:  # right arm
-                        sh_idx = 6
-                    prev_sh_xi = self._kalman_filters[sh_idx]['x']
-                    prev_sh_yi = self._kalman_filters[sh_idx]['y']
-                    prev_arm_xi = self._kalman_filters[i]['x']
-                    prev_arm_yi = self._kalman_filters[i]['y']
-                    offset_x = prev_arm_xi - prev_sh_xi
-                    offset_y = prev_arm_yi - prev_sh_yi
-                    xk = prev_sh_xi + np.clip(offset_x, -0.18, 0.18)
-                    yk = prev_sh_yi + np.clip(offset_y, -0.18, 0.18)
-                else:
-                    if c < 0.20:
-                        xk, yk = self._kalman_predict_update(self._kalman_filters[i], self._kalman_filters[i]['x'], self._kalman_filters[i]['y'], 0.01)
-                    else:
-                        prev_x, prev_y = self._kalman_filters[i]['x'], self._kalman_filters[i]['y']
-                        xk, yk = self._kalman_predict_update(self._kalman_filters[i], x, y, min(c, 0.7))
-                        max_move = 0.04
-                        dx = np.clip(xk - prev_x, -max_move, max_move)
-                        dy = np.clip(yk - prev_y, -max_move, max_move)
-                        xk = prev_x + dx
-                        yk = prev_y + dy
-                kps[i, 0] = xk
-                kps[i, 1] = yk
-            else:
-                # Non-arm keypoints: normal Kalman smoothing
-                if c < 0.10:
-                    xk, yk = self._kalman_predict_update(self._kalman_filters[i], self._kalman_filters[i]['x'], self._kalman_filters[i]['y'], 0.01)
-                else:
-                    xk, yk = self._kalman_predict_update(self._kalman_filters[i], x, y, c)
-                kps[i, 0] = xk
-                kps[i, 1] = yk
-        out = keypoints_with_scores.copy()
-        out[0, 0, :, :] = kps
-        return out
 
     def _build_neighbors(self):
         neighbors = {i: set() for i in range(17)}
@@ -551,8 +374,6 @@ class PoseProcessor:
         alphaT = float(self.temporal_alpha)
         betaS = float(self.spatial_beta)
         gammaC = max(0.0, 1.0 - alphaT - betaS)  # weight for current
-        conf_thr = float(self.conf_threshold)
-        min_neigh_conf = float(self.spatial_min_conf)
 
         # Compute neighbor averages for spatial term
         neigh_avg = np.zeros((17, 2), dtype=np.float32)
@@ -560,85 +381,19 @@ class PoseProcessor:
             neigh = self._neighbors.get(i, [])
             pts = []
             for j in neigh:
-                if conf[j] >= min_neigh_conf:
-                    pts.append([kps[j, 0], kps[j, 1]])
+                pts.append([kps[j, 0], kps[j, 1]])
             if pts:
                 pts_arr = np.array(pts, dtype=np.float32)
                 neigh_avg[i, 0] = float(np.mean(pts_arr[:, 0]))
                 neigh_avg[i, 1] = float(np.mean(pts_arr[:, 1]))
             else:
-                # Fallback to previous smoothed as neighbor proxy if none confident
                 neigh_avg[i, 0] = prev[i, 0]
                 neigh_avg[i, 1] = prev[i, 1]
 
-        # Blend positions with confidence-aware weighting
-        max_jump_px = 16  # stricter max allowed jump in pixels for all keypoints
+        # Basic EMA smoothing: blend current, previous, and neighbor average
         for i in range(17):
-            conf_normalized = min(max(conf[i], 0.0), 1.0)
-            # If confidence is very low, always use previous value
-            if conf[i] < 0.3:
-                kps[i, 0:2] = prev[i, 0:2]
-                continue
-            # Weighted average of last 3 frames for each keypoint if available
-            if len(self._hist) >= 3:
-                hist_stack = np.stack(self._hist, axis=0)  # (T,17,2)
-                weights = np.array([0.2, 0.3, 0.5])  # most recent gets highest weight
-                avg = np.average(hist_stack[-3:, i, :], axis=0, weights=weights)
-                dist_avg = np.linalg.norm(kps[i, 0:2] - avg)
-                if dist_avg > 0.10 and conf[i] < 0.35:
-                    kps[i, 0:2] = avg
-            # Calculate velocity (change from previous)
-            if len(self._hist) >= 1:
-                velocity = np.linalg.norm(kps[i, 0:2] - prev[i, 0:2])
-            else:
-                velocity = 0.0
-            is_likely_noise = (velocity > 0.05 and conf[i] < 0.25) or (velocity > 0.15 and conf[i] < 0.45)
-            joint_alphaT = alphaT
-            # Clamp large jumps for all keypoints if confidence is low
-            if len(self._hist) >= 1:
-                frame_h = self.last_frame_shape[0] if self.last_frame_shape is not None else 480
-                frame_w = self.last_frame_shape[1] if self.last_frame_shape is not None else 640
-                jump_px = np.linalg.norm([
-                    (kps[i, 0] - prev[i, 0]) * frame_h,
-                    (kps[i, 1] - prev[i, 1]) * frame_w
-                ])
-                if jump_px > max_jump_px and conf[i] < 0.5:
-                    kps[i, 0:2] = prev[i, 0:2]
-                    continue
-            # Standard handling for all keypoints
-            if is_likely_noise:
-                g = gammaC * 0.12
-            elif conf[i] >= conf_thr:
-                if conf[i] > 0.5:
-                    conf_scale = 3.0 + (conf_normalized - 0.5) / 0.5 * 6.0
-                else:
-                    conf_scale = 1.0 + (conf_normalized - conf_thr) / (0.5 - conf_thr) * 2.0
-                g = gammaC * conf_scale
-            else:
-                g = 0.0
-            total_weight = g + joint_alphaT + betaS
-            if total_weight > 0:
-                g_norm = g / total_weight
-                alpha_norm = joint_alphaT / total_weight
-                beta_norm = betaS / total_weight
-            else:
-                g_norm = 0.0
-                alpha_norm = 1.0
-                beta_norm = 0.0
-            # Snap stuck keypoints to current detection if too far from predicted
-            max_snap_dist = 0.18
-            dist_from_pred = np.linalg.norm(kps[i, 0:2] - prev[i, 0:2])
-            if dist_from_pred > max_snap_dist and conf[i] > 0.10:
-                kps[i, 0:2] = kps[i, 0:2]
-            else:
-                kps[i, 0] = g_norm * kps[i, 0] + alpha_norm * prev[i, 0] + beta_norm * neigh_avg[i, 0]
-                kps[i, 1] = g_norm * kps[i, 1] + alpha_norm * prev[i, 1] + beta_norm * neigh_avg[i, 1]
-
-        # Velocity lookahead disabled to prevent overshoot with noisy detections
-        # (lead_gain = 0.0)
-        
-        # Robust outlier guard using short history and per-frame pixel clamp
-        kps[:, 0:2] = self._apply_outlier_guard(kps[:, 0:2], prev[:, 0:2], keypoints_with_scores)
+            kps[i, 0] = gammaC * kps[i, 0] + alphaT * prev[i, 0] + betaS * neigh_avg[i, 0]
+            kps[i, 1] = gammaC * kps[i, 1] + alphaT * prev[i, 1] + betaS * neigh_avg[i, 1]
 
         # Update prev smoothed and history
         self._prev_smoothed[:, 0:2] = kps[:, 0:2]
