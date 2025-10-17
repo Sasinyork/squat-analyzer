@@ -302,9 +302,24 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     """Draw comprehensive feedback on the image with mobile-optimized layout."""
     height, width, _ = image.shape
     
+
     # Calculate adaptive background height based on content - increased for larger text
     base_height = 100  # Base height accommodates title area
     extra_height = 0
+
+    # Add extra height for phase if squat mode and phase info present
+    show_reps = False
+    rep_text = ""
+    phase_text = ""
+    if feedback.get('exercise_mode') == 'squat' and feedback.get('form_analysis'):
+        fa = feedback['form_analysis']
+        if 'phase' in fa:
+            phase_text = f"Phase: {fa.get('phase','')}"
+            extra_height += 28
+        if any(k in fa for k in ['rep_count', 'correct_rep_count', 'incorrect_rep_count']):
+            show_reps = True
+            rep_text = f"Reps: {fa.get('rep_count',0)}  Correct: {fa.get('correct_rep_count',0)}  Incorrect: {fa.get('incorrect_rep_count',0)}"
+            # Don't add extra height here, we'll move it to the top
 
     # Add extra height dynamically based on number of status lines (back/depth) and recommendation lines
     status_lines = 0
@@ -352,35 +367,64 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     
     # Position overlay with margin from bottom and sides
     margin = 5  # Base bottom margin
-    side_margin = min(200, width // 10)  # Much smaller side margins for wider feedback background
-    # Raise the whole overlay a bit from the bottom so it doesn't sit on top of content
-    bottom_offset = min(int(height * 0.06), 64)  # ~6% of height, capped
+    side_margin = min(200, width // 10)
+    bottom_offset = min(int(height * 0.06), 64)
     bg_y_start = max(0, height - text_bg_height - margin - bottom_offset)
-    
+
     # Ensure valid rectangle coordinates
     x1 = side_margin
     x2 = width - side_margin
     y1 = bg_y_start
     y2 = min(height - margin - bottom_offset + (height - (bg_y_start + text_bg_height + margin)), height - margin)
+
+    # Draw rep counter at the very top of the image with background
+    if show_reps:
+        rep_font = cv2.FONT_HERSHEY_SIMPLEX
+        rep_font_scale = 1.1
+        rep_thickness = 3
+        rep_size = cv2.getTextSize(rep_text, rep_font, rep_font_scale, rep_thickness)[0]
+        rep_bg_height = rep_size[1] + 24
+        rep_bg_y1 = 0
+        rep_bg_y2 = rep_bg_height
+        rep_bg_x1 = 0
+        rep_bg_x2 = width
+        # Draw background
+        image = draw_rounded_rectangle_with_alpha(image, rep_bg_x1, rep_bg_y1, rep_bg_x2, rep_bg_y2, (0, 0, 0), alpha=0.8, radius=0)
+        # Draw text centered
+        rep_x = (width - rep_size[0]) // 2
+        rep_y = rep_bg_y1 + rep_size[1] + 12
+        cv2.putText(image, rep_text, (rep_x, rep_y), rep_font, rep_font_scale, (255,255,255), rep_thickness)
     
     # Only draw if we have a valid rectangle
     if x1 < x2 and y1 < y2:
         # Draw rounded rectangle background with alpha transparency
         image = draw_rounded_rectangle_with_alpha(image, x1, y1, x2, y2, (0, 0, 0), alpha=0.7, radius=10)
         
-        # Draw main feedback message
+
+        # Draw rep counter if enabled (at the top of overlay)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1.1  # Increased font size for better visibility
-        thickness = 3
-        
-        # Main message - adjust for narrower width
-        text_size = cv2.getTextSize(feedback['message'], font, font_scale, thickness)[0]
-        text_x = ((width - side_margin * 2) - text_size[0]) // 2 + side_margin
-        text_y = bg_y_start + 20
-        cv2.putText(image, feedback['message'], (text_x, text_y), font, font_scale, feedback['color'], thickness)
+        font_scale = 0.95
+        thickness = 2
+        y_offset = 20
+        # Draw phase if available (above main feedback)
+        if phase_text:
+            phase_size = cv2.getTextSize(phase_text, font, font_scale, thickness)[0]
+            phase_x = ((width - side_margin * 2) - phase_size[0]) // 2 + side_margin
+            phase_y = bg_y_start + y_offset
+            cv2.putText(image, phase_text, (phase_x, phase_y), font, font_scale, (200,255,200), thickness)
+            y_offset += 28
+
+    # Draw main feedback message
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.1  # Increased font size for better visibility
+    thickness = 3
+    text_size = cv2.getTextSize(feedback['message'], font, font_scale, thickness)[0]
+    text_x = ((width - side_margin * 2) - text_size[0]) // 2 + side_margin
+    text_y = bg_y_start + y_offset
+    cv2.putText(image, feedback['message'], (text_x, text_y), font, font_scale, feedback['color'], thickness)
         
         # Draw form analysis if available (compact)
-        if feedback.get('form_analysis'):
+    if feedback.get('form_analysis'):
             form_analysis = feedback['form_analysis']
             if feedback.get('exercise_mode') == 'deadlift':
                 # Collect all actionable recommendations for deadlift (hip, knee, spine)
@@ -466,7 +510,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 if phase_is_bottom and has_any_status:
                     is_good = depth_good and back_good
                     pill_color = (0, 255, 0) if is_good else (255, 0, 0)
-                    label = 'GOOD FORM' if is_good else 'INCORRECT FORM'
+                    label = 'CORRECT FORM' if is_good else 'INCORRECT FORM'
 
                     # Compute pill dimensions based on text size
                     pill_font = cv2.FONT_HERSHEY_SIMPLEX
