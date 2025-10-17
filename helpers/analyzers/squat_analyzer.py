@@ -235,7 +235,6 @@ class SquatFormAnalyzer:
                         issues.append({
                             'type': 'back_rounding',
                             'severity': 'high' if back_angle < (angle_threshold - 10) else 'medium',
-                            'message': 'Back is rounding',
                             'recommendation': 'Keep chest up and back straight'
                         })
             
@@ -246,7 +245,6 @@ class SquatFormAnalyzer:
                     issues.append({
                         'type': 'shoulder_tilt',
                         'severity': 'medium',
-                        'message': 'Shoulders are not level',
                         'recommendation': 'Keep shoulders level and square'
                     })
         
@@ -281,7 +279,6 @@ class SquatFormAnalyzer:
                 issues.append({
                     'type': 'knee_tracking',
                     'severity': 'medium',
-                    'message': 'Knees are tracking too far outside stance',
                     'recommendation': 'Keep knees within your stance width'
                 })
             
@@ -297,7 +294,6 @@ class SquatFormAnalyzer:
                 issues.append({
                     'type': 'knee_forward',
                     'severity': 'medium',
-                    'message': 'Knees are going too far forward',
                     'recommendation': 'Keep knees behind toes, sit back more'
                 })
             
@@ -346,7 +342,6 @@ class SquatFormAnalyzer:
                     issues.append({
                         'type': 'insufficient_depth',
                         'severity': 'medium',
-                        'message': 'Squat depth is insufficient',
                         'recommendation': 'Go deeper - hips should be at least parallel with knees'
                     })
                 # good depth is when hip is aligned with knee level
@@ -388,7 +383,6 @@ class SquatFormAnalyzer:
                 issues.append({
                     'type': 'arm_position',
                     'severity': 'low',
-                    'message': 'Arms could be raised higher',
                     'recommendation': 'Extend arms forward or raise them higher'
                 })
         
@@ -489,9 +483,9 @@ class SquatFormAnalyzer:
                 # Add recommendation for good depth
                 feedback['recommendations'] = ['Great! Knee level is the minimum, but going deeper is even better - especially for building strength and muscle.']
             else:
-                # Show the first depth issue (insufficient or excessive)
                 feedback['depth_status'] = 'needs_improvement'
-                feedback['depth_message'] = depth_issues[0]['message']
+                # Use the first recommendation for depth issues, or a generic message
+                feedback['depth_message'] = depth_issues[0]['recommendation'] if 'recommendation' in depth_issues[0] else 'Needs improvement'
         else:
             feedback['depth_status'] = None
             feedback['depth_message'] = None
@@ -499,7 +493,8 @@ class SquatFormAnalyzer:
         # Back rounding feedback (always show if detected)
         if back_issues:
             feedback['back_status'] = 'needs_improvement'
-            feedback['back_message'] = next((i['message'] for i in back_issues if i['type'] == 'back_rounding'), back_issues[0]['message'])
+            # Use the first recommendation for back issues, or a generic message
+            feedback['back_message'] = next((i['recommendation'] for i in back_issues if i['type'] == 'back_rounding' and 'recommendation' in i), back_issues[0]['recommendation'] if 'recommendation' in back_issues[0] else 'Needs improvement')
         else:
             feedback['back_status'] = 'good'
             feedback['back_message'] = 'Good back position - neutral spine maintained'
