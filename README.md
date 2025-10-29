@@ -1,30 +1,60 @@
-# MoveNet Lightning - Squat Form Analysis
+# MoveNet Lightning – Multi‑Exercise Form Analysis
 
-A powerful real-time pose detection and squat form analysis application using Google's MoveNet Lightning model. This project provides comprehensive feedback on squat form, detecting common issues like back rounding, knee alignment, depth problems, and arm positioning.
+A real-time pose detection and form analysis app powered by Google’s MoveNet Lightning model. The project provides unified, color‑coded feedback overlays for Squat, Bench Press, and Deadlift, including phase detection, rep counting, issue detection, and actionable recommendations.
 
 ## 🚀 Features
 
-### Advanced Squat Form Analysis
+### Supported Exercises (with phase detection)
 
-- **Back Rounding Detection**: Analyzes spine alignment and detects excessive forward lean
-- **Knee Alignment Analysis**: Monitors knee position relative to toes and detects valgus (knees caving in)
-- **Squat Depth Monitoring**: Ensures proper depth (thighs parallel to ground)
-- **Arm Position Feedback**: Analyzes arm positioning for optimal balance
-- **Real-time Form Scoring**: Provides 0-100 form score with color-coded feedback
+- Squat: standing → descending → bottom → ascending
+- Bench Press: rest/pause → lowering → bottom → pressing → stable
+- Deadlift: standing → descending → bottom → ascending
 
-### Pose Detection Features
+### Core Analysis Capabilities
 
-- **Real-time Webcam Processing**: Live pose detection with form analysis
-- **Video File Processing**: Analyze pre-recorded videos with comprehensive feedback
-- **Enhanced Keypoint Visualization**: Improved skeleton rendering with color-coded body parts
-- **Adaptive Thresholds**: Different sensitivity levels for different body parts
+- Real-time phase detection with debouncing to reduce flicker
+- Rep counting with robust phase sequence validation and double-count prevention
+- Issue detection with severity (low/medium/high) and color-coded emphasis
+- Actionable recommendations with short persistence so you can read them
 
-### User Interface Improvements
+### Pose Detection & Processing
 
-- **Bottom-aligned Feedback**: Form analysis displayed at bottom of screen
-- **Comprehensive Information**: Form score, phase detection, issues, and recommendations
-- **Color-coded Feedback**: Green (good), Orange (needs improvement), Red (issues)
-- **Real-time Recommendations**: Actionable tips for form improvement
+- Real-time webcam and video file processing
+- MoveNet Lightning TFLite model loading from local file
+- Rotation handling for portrait videos with automatic counter-rotation on display
+- Keypoint smoothing (bench) and rotated-keypoint analysis for lying positions
+
+### Unified, Mobile-Friendly Overlay UI
+
+- Bottom-aligned, rounded, semi-transparent overlay with per-line “pills”
+- Unified Phase pill across all exercises with a natural, muted color palette
+- Natural, muted color palette for feedback messages and severity levels
+- Fixed overlay height for Squat and Deadlift to prevent UI “jumping”
+- Top bar rep counter (REPS, CORRECT, INCORRECT) across modes
+- Compact per-line backgrounds with automatic readable text color
+
+### Exercise-Specific Details
+
+- Squat
+
+  - Back rounding/forward-lean detection and posture checks
+  - Knee alignment/tracking and valgus (knees caving in) detection
+  - Depth monitoring with targeted feedback (e.g., “Go deeper”)
+  - Rep counting and basic correctness tracking
+  - Severity-aware coloring for issues and status lines
+
+- Bench Press
+
+  - Rotated-keypoint analysis for lying position (consistent “depth” trend)
+  - Smoothed keypoints and stable/pressing/lowering detection
+  - Unified Phase pill and rep counter UI
+
+- Deadlift
+  - Phase detection with robust transitions and state holding
+  - Hip extension/hinge cueing and torso alignment checks
+  - Knee tracking and basic balance/weight distribution feedback
+  - Persistent actionable recommendations (limited-time display)
+  - Fixed-height overlay like squat to avoid jitter when messages appear
 
 ## 📋 Requirements
 
@@ -63,44 +93,36 @@ Run the application:
 python3 main.py
 ```
 
-### Step-by-Step Guide
+### Interactive Flow
 
-1. **Select Analysis Mode**:
+1. Select Exercise Mode:
 
    ```
-   Available Options:
-   1. Squat Form Analysis (Webcam)
-   2. Squat Form Analysis (Video File)
-   3. Basic Pose Detection (Webcam)
-   4. Basic Pose Detection (Video File)
+   1. Squat
+   2. Bench Press
+   3. Deadlift
    ```
 
-2. **For Squat Form Analysis**:
+2. Choose a sample video to process or run live (if implemented), and whether to save the output.
 
-   - Position yourself for squats (side view recommended)
-   - Ensure good lighting and full body visibility
-   - Hold still for 2-3 seconds to get initial feedback
-   - Perform squats while the system analyzes your form
-   - Watch for real-time feedback and recommendations
+3. Perform the selected exercise while the overlay shows phase, rep counts, and feedback. Hold still briefly to allow stable analysis when needed.
 
-3. **Understanding the Feedback**:
+### Understanding the Feedback
 
-   - **Form Score**: 0-100 rating of your overall form
-   - **Phase Detection**: Standing, Descending, Bottom, Ascending
-   - **Issues**: Specific form problems detected
-   - **Recommendations**: Actionable tips for improvement
+- Phase pill: current phase with a muted color (green for up/press, amber for down/lowering, yellow for bottom, gray for rest/standing)
+- Rep bar (top): total reps, correct, and incorrect (when supported by analyzer)
+- Feedback “pills”: per-line messages for back/depth/knees/balance/etc., severity-colored
+- Recommendations: concise, actionable suggestions; may persist briefly for readability
 
 ## 🎮 Controls
 
-### Webcam Mode
+While processing:
 
-- **'q'**: Quit the application
-- **Real-time feedback**: Continuous form analysis and recommendations
-
-### Video Processing Mode
-
-- **'q'**: Stop processing early
-- **Progress updates**: Displayed every 30 frames
+- `q` – Quit
+- `s` – Switch to Squat mode
+- `b` – Switch to Bench mode
+- `d` – Switch to Deadlift mode
+- `p` – Pause/Resume
 
 ## 📊 Form Analysis Features
 
@@ -141,40 +163,48 @@ python3 main.py
 
 ### Visual Elements
 
-- **Enhanced Skeleton**: Thicker, more visible connections
-- **Confidence Indicators**: Green rings around high-confidence keypoints
-- **Color-coded Feedback**: Bottom overlay with comprehensive information
-- **Real-time Scoring**: Live form score updates
+- Enhanced skeleton and connection styling
+- Confidence indicators for high-confidence keypoints
+- Bottom overlay with rounded, semi-transparent backgrounds
+- Unified Phase pill and natural color palette across exercises
+- Fixed overlay height for consistent UI (squat and deadlift)
 
 ## 📁 Project Structure
 
 ```
 movenet-lightning/
-├── main.py                 # Main application script
-├── test_squat_analysis.py  # Test script for system verification
-├── requirements.txt        # Python dependencies
-├── README.md              # This file
+├── main.py                    # Main runner (exercise/video selection, processing)
+├── main_old.py, main_backup.py# Legacy/backup runners
+├── model.tflite               # MoveNet Lightning model
+├── requirements.txt           # Python dependencies
+├── README.md                  # This file
 ├── helpers/
-│   ├── __init__.py
-│   ├── model_utils.py     # Model loading utilities
-│   ├── squat_analyzer.py  # Squat form analysis engine
-│   ├── feedback_utils.py  # Comprehensive feedback system
-│   ├── pose_processor.py  # Pose detection processing
-│   └── visualization_utils.py  # Enhanced visualization functions
-├── data/                  # Sample data directory
-└── output/               # Output directory for processed videos
+│   ├── feedback_utils.py      # Unified overlay UI + feedback assembly
+│   ├── pose_processor.py      # Pose processing pipeline + overlay draw
+│   ├── analyzers/
+│   │   ├── squat_analyzer.py  # Squat form analysis + phases + reps
+│   │   ├── bench_analyzer.py  # Bench press analysis (rotation + smoothing)
+│   │   └── deadlift_analyzer.py # Deadlift analysis (hip hinge, balance, phases)
+│   └── utils/
+│       ├── model_utils.py     # Model loading helpers
+│       └── visualization_utils.py # Drawing helpers for skeleton/overlays
+├── data/
+│   ├── squat/                 # Sample squat videos
+│   ├── bench/                 # Sample bench press videos
+│   └── deadlift/              # Sample deadlift videos
+└── output/                    # Saved processed videos (optional)
 ```
 
 ## 🔧 Configuration
 
 ### Adjustable Parameters
 
-In the squat analyzer (`helpers/squat_analyzer.py`), you can modify:
+In the analyzers, you can modify:
 
-- **Angle Thresholds**: Back rounding detection sensitivity
-- **Depth Thresholds**: Squat depth requirements
-- **Alignment Thresholds**: Knee-to-toe alignment tolerance
-- **Confidence Thresholds**: Keypoint detection sensitivity
+- Angle/Depth thresholds (squat), posture/hinge checks (deadlift), movement thresholds (bench)
+- Phase debounce frame counts and min-frames per phase
+- Keypoint confidence thresholds and smoothing parameters
+- Color palette (muted greens/ambers/grays) for phases and messages in `feedback_utils.py`
 
 ### Performance Tips
 
@@ -229,17 +259,14 @@ In the squat analyzer (`helpers/squat_analyzer.py`), you can modify:
 
 ### Testing the System
 
-Run the test script to verify all components work:
+If you have tests, run them to verify components work:
 
 ```bash
-python3 test_squat_analysis.py
+# example
+# python3 tests/test_squat_analysis.py
 ```
 
-This will test:
-
-- Squat form analyzer
-- Feedback system
-- Visualization components
+This typically covers analyzer logic, feedback aggregation, and visualization helpers.
 
 ## 🤝 Contributing
 
@@ -261,8 +288,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🎯 Future Enhancements
 
-- Support for other exercises (deadlift, bench press)
-- Rep counting and set tracking
+- Set tracking and workout summaries
 - Form history and progress tracking
 - Mobile app version
 - Integration with fitness apps
