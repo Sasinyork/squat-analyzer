@@ -24,24 +24,7 @@ class DeadliftFormAnalyzer:
             avg_hip_x = (left_hip[0] + right_hip[0]) / 2
             avg_shoulder_x = (left_shoulder[0] + right_shoulder[0]) / 2
 
-            # Forward weight shift: ankle rises (y decreases) or moves forward (x increases) relative to hip/shoulder during ascent
-            if phase == 'ascending':
-                # If ankle y is much higher than hip/shoulder y (i.e., foot is coming off ground)
-                if avg_ankle_y < min(avg_hip_y, avg_shoulder_y) - 30:  # 30px threshold, tune as needed
-                    issues.append({
-                        'type': 'forward_weight_shift',
-                        'severity': 'medium',
-                        'message': 'Possible forward weight shift (heels lifting)',
-                        'recommendation': 'Keep weight balanced over midfoot; avoid lifting heels.'
-                    })
-                # If ankle x moves much forward of hip/shoulder x (for side view)
-                if abs(avg_ankle_x - avg_hip_x) > 50 and avg_ankle_x > avg_hip_x:
-                    issues.append({
-                        'type': 'forward_weight_shift',
-                        'severity': 'medium',
-                        'message': 'Possible forward weight shift (ankles ahead of hips)',
-                        'recommendation': 'Keep weight balanced; avoid letting ankles move far ahead of hips.'
-                    })
+            # Removed forward weight shift detection per request
 
             # Backward lean at lockout: hips forward of ankles, torso leans back
             if phase == 'standing':
@@ -50,7 +33,6 @@ class DeadliftFormAnalyzer:
                     issues.append({
                         'type': 'backward_lean',
                         'severity': 'medium',
-                        'message': 'Excessive backward lean at lockout',
                         'recommendation': 'Finish tall and neutral; avoid leaning back at lockout.'
                     })
                 # Shoulders behind hips (x axis, for side view)
@@ -58,7 +40,6 @@ class DeadliftFormAnalyzer:
                     issues.append({
                         'type': 'backward_lean',
                         'severity': 'low',
-                        'message': 'Torso leans back past vertical at lockout',
                         'recommendation': 'Keep torso stacked over hips at lockout.'
                     })
         return issues
@@ -81,42 +62,65 @@ class DeadliftFormAnalyzer:
             bc = np.array([c[0] - b[0], c[1] - b[1]])
             cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
             return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
-        # Lower back rounding: hip-shoulder-knee angle (should be ~180, lower = rounding)
-        left_lb_angle = angle(left_hip, left_shoulder, left_knee)
-        right_lb_angle = angle(right_hip, right_shoulder, right_knee)
-        avg_lb_angle = (left_lb_angle + right_lb_angle) / 2
-        if avg_lb_angle < 145:
-            issues.append({
-                'type': 'lumbar_flexion',
-                'severity': 'high',
-                'message': 'Lower back rounding detected',
-                'recommendation': 'Maintain a neutral lower back; avoid rounding.'
-            })
-        # Upper back rounding: nose-shoulder-hip angle (should be ~180, lower = rounding)
+        
+        # Determine which side is more visible (higher confidence) for side view
+        # Get confidence scores for each side
+        left_confidence = (keypoints[self.LEFT_SHOULDER, 2] + keypoints[self.LEFT_HIP, 2] + keypoints[self.LEFT_KNEE, 2]) / 3
+        right_confidence = (keypoints[self.RIGHT_SHOULDER, 2] + keypoints[self.RIGHT_HIP, 2] + keypoints[self.RIGHT_KNEE, 2]) / 3
+        
+        # Use the side with higher confidence (more visible in side view)
+        if left_confidence >= right_confidence:
+            use_left = True
+            shoulder, hip, knee = left_shoulder, left_hip, left_knee
+            nose_shoulder_confidence = keypoints[self.LEFT_SHOULDER, 2]
+        else:
+            use_left = False
+            shoulder, hip, knee = right_shoulder, right_hip, right_knee
+            nose_shoulder_confidence = keypoints[self.RIGHT_SHOULDER, 2]
+        
+        # Upper back signal: angle at SHOULDER (nose-shoulder-hip), ~180 when neutral
+        avg_ub_angle = None
         if nose:
-            left_ub_angle = angle(nose, left_shoulder, left_hip)
-            right_ub_angle = angle(nose, right_shoulder, right_hip)
-            avg_ub_angle = (left_ub_angle + right_ub_angle) / 2
-            if avg_ub_angle < 145:
-                issues.append({
-                    'type': 'thoracic_flexion',
-                    'severity': 'medium',
-                    'message': 'Upper back rounding detected',
-                    'recommendation': 'Keep chest up and avoid excessive upper back rounding.'
-                })
-        # Hyperextension: at lockout (standing), if hip-shoulder-knee angle > 195
-        if phase == 'standing' and avg_lb_angle > 205:
+            avg_ub_angle = angle(nose, shoulder, hip)
+
+        # Fixed threshold for upper back rounding
+        ub_threshold = 125
+        ub_trigger = (avg_ub_angle is not None) and (avg_ub_angle < ub_threshold)
+
+        if ub_trigger:
             issues.append({
-                'type': 'hyperextension',
+                'type': 'back_rounding',
                 'severity': 'medium',
-                'message': 'Excessive arching at lockout (hyperextension)',
-                'recommendation': 'Do not over-arch your back at the top; finish tall and neutral.'
+                'recommendation': 'Keep back neutral; avoid rounding.'
             })
-        # Torso angle consistency: track torso angle (shoulder-hip to vertical) across movement
-        # Save torso angle history for consistency check
+        
+        # Improved: Use standing position as vertical reference for torso angle
         torso_vec = np.array([(left_shoulder[0] + right_shoulder[0]) / 2 - (left_hip[0] + right_hip[0]) / 2,
                               (left_shoulder[1] + right_shoulder[1]) / 2 - (left_hip[1] + right_hip[1]) / 2])
-        torso_angle = np.degrees(np.arctan2(torso_vec[0], torso_vec[1]))  # Angle from vertical
+        torso_angle = np.degrees(np.arctan2(torso_vec[0], torso_vec[1]))
+        
+        # Save standing torso angle as reference (baseline "vertical" for this person)
+        if not hasattr(self, '_standing_torso_angle_ref'):
+            self._standing_torso_angle_ref = None
+        if phase == 'standing':
+            # Use a running average for stability
+            if self._standing_torso_angle_ref is None:
+                self._standing_torso_angle_ref = torso_angle
+            else:
+                self._standing_torso_angle_ref = 0.8 * self._standing_torso_angle_ref + 0.2 * torso_angle
+        
+        # Only trigger if back is actually horizontal or below (difference from standing ≥ 80°)
+        if phase == 'bottom' and self._standing_torso_angle_ref is not None:
+            angle_diff = abs(torso_angle - self._standing_torso_angle_ref)
+            if angle_diff >= 80:
+                issues.append({
+                    'type': 'torso_too_horizontal',
+                    'severity': 'high',
+                    'recommendation': 'Torso is horizontal or below at bottom; keep chest up and stop before your back is parallel to the ground.'
+                })
+        
+        # Torso angle consistency: track torso angle (shoulder-hip to vertical) across movement
+        # Save torso angle history for consistency check
         if not hasattr(self, '_torso_angle_history'):
             self._torso_angle_history = []
         self._torso_angle_history.append(torso_angle)
@@ -129,7 +133,6 @@ class DeadliftFormAnalyzer:
                 issues.append({
                     'type': 'torso_angle_inconsistent',
                     'severity': 'low',
-                    'message': 'Torso angle is changing too much during descent',
                     'recommendation': 'Maintain a consistent torso angle throughout the movement.'
                 })
         return issues
@@ -157,19 +160,9 @@ class DeadliftFormAnalyzer:
             issues.append({
                 'type': 'knee_forward',
                 'severity': 'medium',
-                'message': 'Knees are traveling too far forward',
                 'recommendation': 'Keep shins more vertical; avoid knees past toes.'
             })
-        # Collapse/valgus: knees caving in (x distance between knees < ankles)
-        knee_dist = abs(left_knee[0] - right_knee[0])
-        ankle_dist = abs(left_ankle[0] - right_ankle[0])
-        if knee_dist < ankle_dist * 0.7:
-            issues.append({
-                'type': 'knee_valgus',
-                'severity': 'high',
-                'message': 'Knees are caving inward (valgus)',
-                'recommendation': 'Push knees outward and keep them aligned with feet.'
-            })
+        # Knee valgus detection removed: side view is unreliable for "knees out" assessment
         # 2. Knee bend timing: knees bend too early in RDL descent (should hinge hips first)
         # If phase is descending and knees bend before hips move back, flag it
         # Use hip and knee angles: if knee angle decreases before hip moves back, it's early knee bend
@@ -189,7 +182,6 @@ class DeadliftFormAnalyzer:
                     issues.append({
                         'type': 'knee_bend_timing',
                         'severity': 'medium',
-                        'message': 'Knees are bending too early in descent',
                         'recommendation': 'Initiate descent by hinging hips back before bending knees.'
                     })
         else:
@@ -213,7 +205,6 @@ class DeadliftFormAnalyzer:
                 issues.append({
                     'type': 'knee_lockout',
                     'severity': 'low',
-                    'message': 'Knees are not fully locked out at the top',
                     'recommendation': 'Stand tall and fully extend knees at the top.'
                 })
         return issues
@@ -239,15 +230,35 @@ class DeadliftFormAnalyzer:
     """Analyzes deadlift form and detects movement phases: standing, descending, ascending. Also stubs for hip hinge and premature hip rise."""
     def __init__(self):
         self.prev_keypoints = None
-        self.deadlift_phase = "standing"  # standing, descending, ascending
+        self.deadlift_phase = "standing"  # standing, descending, bottom, ascending
         self.phase_frames = 0
         self.hip_positions = []  # Track hip y positions for movement
         self.hip_x_positions = []  # Track hip x positions for hinge
         self.shoulder_y_positions = []  # For premature hip rise
         self.max_history = 10
         self.movement_threshold = 5  # Minimum pixel movement to detect direction
-        self.hip_hinge_threshold = 8  # Minimum horizontal movement to count as hinge
-        self.standing_vertical_threshold = 30  # px, for vertical alignment
+        # Minimum horizontal movement thresholds for hinge detection (hip relative to shoulder)
+        self.hip_hinge_threshold_desc = 14  # less sensitive for descending
+        self.hip_hinge_threshold_asc = 8   # keep ascending sensitivity similar
+        # Standing sensitivity: allow a bit more lateral variance to classify standing
+        self.standing_vertical_threshold = 40  # px, for vertical alignment (was 30)
+        # Deadband for minimal hinge change to consider posture as standing/neutral
+        # Made stricter (was 10) to avoid premature bottom detection during slow descents
+        self.standing_deadband = 3 # px delta in hip-to-shoulder x (smaller = less sensitive, requires more stillness)
+
+        # Rep counting state (mirroring squat analyzer)
+        self.rep_count = 0
+        self.correct_rep_count = 0
+        self.incorrect_rep_count = 0
+        self._rep_state = {
+            'in_rep': False,
+            'bottom_reached': False,
+            'issues_at_bottom': [],
+        }
+        self._last_bottom_issues = []  # Store issues at last bottom phase for rep correctness
+        self._phase_queue = []  # Track last N phases
+        self._max_phase_queue = 5
+        self._last_phase = None
 
         # MoveNet keypoint indices
         self.NOSE = 0
@@ -346,17 +357,17 @@ class DeadliftFormAnalyzer:
         hip_to_shoulder_delta = hip_to_shoulder_x_end - hip_to_shoulder_x_start
 
         # If hips move back relative to shoulders (delta negative), it's descending
-        if hip_to_shoulder_delta < -self.hip_hinge_threshold:
+        if hip_to_shoulder_delta < -self.hip_hinge_threshold_desc:
             return "descending", hip_to_shoulder_delta
-        elif hip_to_shoulder_delta > self.hip_hinge_threshold:
+        elif hip_to_shoulder_delta > self.hip_hinge_threshold_asc:
             return "ascending", hip_to_shoulder_delta
-        elif abs(hip_to_shoulder_delta) < self.hip_hinge_threshold:
+        elif abs(hip_to_shoulder_delta) < self.standing_deadband:
             return "standing", hip_to_shoulder_delta
         else:
             return None, hip_to_shoulder_delta
 
     def detect_deadlift_phase(self, keypoints, image_height, image_width):
-        """Detect the current phase of the deadlift movement: standing, descending, ascending, using hip and shoulder mechanics."""
+        """Detect the current phase of the deadlift movement: standing, descending, bottom, ascending, using hip and shoulder mechanics."""
         left_hip = self.get_keypoint_coords(keypoints, self.LEFT_HIP, image_height, image_width)
         right_hip = self.get_keypoint_coords(keypoints, self.RIGHT_HIP, image_height, image_width)
         left_knee = self.get_keypoint_coords(keypoints, self.LEFT_KNEE, image_height, image_width)
@@ -375,10 +386,28 @@ class DeadliftFormAnalyzer:
                 phase = "standing"
             else:
                 direction, hip_to_shoulder_delta = self.detect_movement_direction(hip_y, hip_x, shoulder_x)
-                if direction == "descending":
+                # --- PHASE TRANSITION LOGIC ---
+                # Enforce valid transitions: standing -> descending -> bottom -> ascending -> standing
+                if direction == "standing":
+                    # Only transition to bottom if coming from descending AND never from standing
+                    # Bottom must have a valid descending phase immediately before it
+                    if self.deadlift_phase == "descending":
+                        phase = "bottom"
+                    elif self.deadlift_phase == "standing":
+                        # If coming from standing and movement is minimal, stay standing
+                        # Don't jump to bottom from standing
+                        phase = "standing"
+                    else:
+                        phase = self.deadlift_phase
+                elif direction == "descending":
+                    # Can transition to descending from standing, bottom, or ascending
                     phase = "descending"
                 elif direction == "ascending":
-                    phase = "ascending"
+                    # Only transition to ascending if coming from bottom or descending
+                    if self.deadlift_phase in ("bottom", "descending"):
+                        phase = "ascending"
+                    else:
+                        phase = self.deadlift_phase
                 else:
                     phase = self.deadlift_phase  # Hold last phase if uncertain
             self.deadlift_phase = phase
@@ -389,21 +418,71 @@ class DeadliftFormAnalyzer:
         """Returns phase and pose info for deadlift, including hip backward extension feedback and weight distribution/balance."""
         keypoints = keypoints_with_scores[0, 0, :, :]
         phase = self.detect_deadlift_phase(keypoints, image_height, image_width)
-        # Hip backward extension analysis
+        
+        # Hip backward extension analysis with severity-based feedback
         hip_ext_norm, hip_ext_px = self.calculate_hip_backward_extension(keypoints, image_height, image_width)
-        hip_extension_issue = None
-        hip_extension_threshold = 0.10  # Minimum normalized extension (tune as needed)
+        hip_extension_issues = []
         hip_extension_status = None
         hip_extension_message = None
         recommendations = []
-        if hip_ext_norm is not None and phase in ("descending", "bottom"):
-            if hip_ext_norm < hip_extension_threshold:
-                hip_extension_status = 'needs_improvement'
-                hip_extension_message = 'Push hips back'
-                recommendations.append('Push hips back')
-            else:
+        recommendations_detailed = []
+        
+        # Thresholds for hip extension (normalized by leg length)
+        good_extension_threshold = 0.12  # Good hip extension
+        moderate_extension_threshold = 0.08  # Just enough extension (low severity)
+        minimal_extension_threshold = 0.04  # Not enough extension (medium severity)
+        # Below minimal_extension_threshold = high severity
+        
+        if hip_ext_norm is not None and phase == "bottom":
+            if hip_ext_norm >= good_extension_threshold:
+                # Good hip extension - show positive feedback
                 hip_extension_status = 'good'
                 hip_extension_message = 'Good hip extension'
+            elif hip_ext_norm >= moderate_extension_threshold:
+                # Just enough - low severity
+                hip_extension_status = 'needs_improvement'
+                hip_extension_message = 'Push hips back more'
+                hip_extension_issues.append({
+                    'type': 'insufficient_hip_extension',
+                    'severity': 'low',
+                    'recommendation': 'Push hips back more'
+                })
+                recommendations.append('Push hips back more')
+                recommendations_detailed.append({
+                    'text': 'Push hips back more',
+                    'type': 'insufficient_hip_extension',
+                    'severity': 'low'
+                })
+            elif hip_ext_norm >= minimal_extension_threshold:
+                # Not enough - medium severity
+                hip_extension_status = 'needs_improvement'
+                hip_extension_message = 'Push hips back'
+                hip_extension_issues.append({
+                    'type': 'insufficient_hip_extension',
+                    'severity': 'medium',
+                    'recommendation': 'Push hips back'
+                })
+                recommendations.append('Push hips back')
+                recommendations_detailed.append({
+                    'text': 'Push hips back',
+                    'type': 'insufficient_hip_extension',
+                    'severity': 'medium'
+                })
+            else:
+                # Too little - high severity
+                hip_extension_status = 'needs_improvement'
+                hip_extension_message = 'Hips need to go back!'
+                hip_extension_issues.append({
+                    'type': 'insufficient_hip_extension',
+                    'severity': 'high',
+                    'recommendation': 'Hips need to go back!'
+                })
+                recommendations.append('Hips need to go back!')
+                recommendations_detailed.append({
+                    'text': 'Hips need to go back!',
+                    'type': 'insufficient_hip_extension',
+                    'severity': 'high'
+                })
 
         # Knee tracking analysis
         knee_issues = self.analyze_knee_tracking(keypoints, image_height, image_width, phase)
@@ -411,44 +490,123 @@ class DeadliftFormAnalyzer:
             # Shorten knee feedback
             short_map = {
                 'Keep shins more vertical; avoid knees past toes.': 'Shins more vertical',
-                'Push knees outward and keep them aligned with feet.': 'Push knees out',
                 'Initiate descent by hinging hips back before bending knees.': 'Hinge hips first',
                 'Stand tall and fully extend knees at the top.': 'Lock knees at top'
             }
             rec = short_map.get(issue['recommendation'], issue['recommendation'])
             recommendations.append(rec)
+            recommendations_detailed.append({
+                'text': rec,
+                'type': issue.get('type', 'unknown'),
+                'severity': issue.get('severity', 'low')
+            })
         # Spine & torso alignment analysis
         spine_issues = self.analyze_spine_torso_alignment(keypoints, image_height, image_width, phase)
         for issue in spine_issues:
             # Shorten spine/torso feedback
             short_map = {
-                'Maintain a neutral lower back; avoid rounding.': 'Neutral lower back',
-                'Keep chest up and avoid excessive upper back rounding.': 'Chest up',
+                'Keep back neutral; avoid rounding.': 'Neutral spine; avoid rounding',
+                'Maintain a neutral lower back; avoid rounding.': 'Neutral spine; avoid rounding',
+                'Keep chest up and avoid excessive upper back rounding.': 'Neutral spine; avoid rounding',
                 'Do not over-arch your back at the top; finish tall and neutral.': 'No over-arch at top',
                 'Maintain a consistent torso angle throughout the movement.': 'Torso angle consistent'
             }
             rec = short_map.get(issue['recommendation'], issue['recommendation'])
             recommendations.append(rec)
+            recommendations_detailed.append({
+                'text': rec,
+                'type': issue.get('type', 'unknown'),
+                'severity': issue.get('severity', 'low')
+            })
         # Weight distribution & balance analysis
         balance_issues = self.analyze_weight_distribution_and_balance(keypoints, image_height, image_width, phase)
         for issue in balance_issues:
-            # Shorten balance feedback
+            # Shorten balance feedback (midfoot cues removed)
             short_map = {
-                'Keep weight balanced over midfoot; avoid lifting heels.': 'Weight midfoot',
-                'Keep weight balanced; avoid letting ankles move far ahead of hips.': 'Weight midfoot',
                 'Finish tall and neutral; avoid leaning back at lockout.': 'Stand tall at top',
                 'Keep torso stacked over hips at lockout.': 'Torso over hips at top'
             }
             rec = short_map.get(issue['recommendation'], issue['recommendation'])
             recommendations.append(rec)
+            recommendations_detailed.append({
+                'text': rec,
+                'type': issue.get('type', 'unknown'),
+                'severity': issue.get('severity', 'low')
+            })
+        # --- REP COUNTING LOGIC (mirroring squat analyzer) ---
+        # Track last N phases
+        if not self._phase_queue or self._phase_queue[-1] != phase:
+            self._phase_queue.append(phase)
+            if len(self._phase_queue) > self._max_phase_queue:
+                self._phase_queue.pop(0)
+
+        # Accumulate issues across the entire rep (not just at bottom)
+        if not hasattr(self, '_rep_issues_accumulated'):
+            self._rep_issues_accumulated = []
+        
+        # Add issues from current phase (avoiding duplicates)
+        current_issues = hip_extension_issues + spine_issues + knee_issues + balance_issues
+        for issue in current_issues:
+            # Only add if not already present (check by type)
+            if not any(i.get('type') == issue.get('type') for i in self._rep_issues_accumulated):
+                self._rep_issues_accumulated.append(issue)
+        
+        # Store issues at bottom phase for rep correctness
+        if phase == "bottom":
+            self._last_bottom_issues = list(self._rep_issues_accumulated)
+
+        # More robust rep detection: allow a single 'stable' or 'unknown' phase in the sequence
+        def matches_expected(seq, expected):
+            if len(seq) != len(expected):
+                return False
+            for s, e in zip(seq, expected):
+                if s == e:
+                    continue
+                if e == "bottom" and s == "stable":
+                    continue
+                if e == "bottom" and s == "unknown":
+                    continue
+                return False
+            return True
+
+        expected_seq = ["standing", "descending", "bottom", "ascending", "standing"]
+        # Only increment rep if last detected rep was not just counted
+        if len(self._phase_queue) >= 5 and matches_expected(self._phase_queue[-5:], expected_seq):
+            # Use a rep-detection flag that resets when a new rep sequence starts
+            if not hasattr(self, '_rep_detected'):
+                self._rep_detected = False
+            if not self._rep_detected:
+                self.rep_count += 1
+                # Only count medium/high severity issues as incorrect (like squat)
+                is_correct = not any(i.get('severity', 'low') in ('medium', 'high') for i in self._last_bottom_issues)
+                if is_correct:
+                    self.correct_rep_count += 1
+                else:
+                    self.incorrect_rep_count += 1
+                self._rep_state['in_rep'] = False
+                self._rep_state['bottom_reached'] = False
+                self._rep_state['issues_at_bottom'] = []
+                self._rep_detected = True
+                # Clear accumulated issues for next rep
+                self._rep_issues_accumulated = []
+        else:
+            self._rep_detected = False
+
+        self._last_phase = phase
+
         return {
             "phase": phase,
             "hip_extension_norm": hip_ext_norm,
             "hip_extension_px": hip_ext_px,
             "hip_extension_status": hip_extension_status,
             "hip_extension_message": hip_extension_message,
+            "hip_extension_issues": hip_extension_issues,
             "knee_issues": knee_issues,
             "spine_issues": spine_issues,
             "balance_issues": balance_issues,
-            "recommendations": recommendations
+            "recommendations": recommendations,
+            "recommendations_detailed": recommendations_detailed,
+            "rep_count": self.rep_count if self.rep_count > 0 else 0,
+            "correct_rep_count": self.correct_rep_count if self.correct_rep_count > 0 else 0,
+            "incorrect_rep_count": self.incorrect_rep_count if self.incorrect_rep_count > 0 else 0
         }

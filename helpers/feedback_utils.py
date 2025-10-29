@@ -167,7 +167,7 @@ class PoseFeedback:
         
         feedback = {
             'message': '',
-            'color': (0, 255, 0),
+            'color': (90, 170, 90),
             'distance_status': None,
             'recommendation': '',
             'person_percentage': person_percentage,
@@ -183,39 +183,18 @@ class PoseFeedback:
                 if form_analysis.get('depth_message'):
                     feedback['message'] = ''
                     if form_analysis.get('depth_status') == 'good':
-                        feedback['color'] = (0, 255, 0)
+                        feedback['color'] = (90, 170, 90)
                     elif form_analysis.get('depth_status') == 'needs_improvement':
-                        feedback['color'] = (0, 165, 255)
+                        feedback['color'] = (60, 160, 255)
                     else:
-                        feedback['color'] = (255, 255, 255)
+                        feedback['color'] = (220, 220, 220)
                 if form_analysis.get('recommendations'):
                     feedback['recommendation'] = form_analysis['recommendations'][0]
             elif self.exercise_mode == "bench":
-                phase = form_analysis.get('phase')
-                if phase:
-                    phase_title = phase.capitalize()
-                    feedback['message'] = f"Bench: {phase_title}"
-                    color_map = {
-                        'pressing': (0, 255, 0),
-                        'lowering': (0, 165, 255),
-                        'bottom': (0, 255, 255),
-                        'rest': (255, 255, 255),
-                        'pause': (255, 255, 255),
-                        'stable': (255, 255, 255)
-                    }
-                    feedback['color'] = color_map.get(phase, (255, 255, 255))
+                # Use unified phase pill; do not set main message/color from phase here
+                pass
             elif self.exercise_mode == "deadlift":
-                phase = form_analysis.get('phase')
-                if phase:
-                    phase_title = phase.capitalize()
-                    feedback['message'] = f"Deadlift: {phase_title}"
-                    color_map = {
-                        'ascending': (0, 255, 0),
-                        'lowering': (0, 165, 255),
-                        'bottom': (0, 255, 255),
-                        'standing': (255, 255, 255)
-                    }
-                    feedback['color'] = color_map.get(phase, (255, 255, 255))
+                # Use unified phase pill; keep actionable feedback below
                 # Show persistent actionable feedback for deadlift
                 actionable = form_analysis.get('recommendations', [])
                 if frame_idx is not None:
@@ -233,7 +212,7 @@ class PoseFeedback:
                     feedback['recommendation'] = ''
         else:
             feedback['message'] = "Hold still for form feedback"
-            feedback['color'] = (0, 165, 255)
+            feedback['color'] = (60, 160, 255)
             feedback['recommendation'] = "Stay in place for form feedback"
         
         return feedback
@@ -307,15 +286,36 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     base_height = 100  # Base height accommodates title area
     extra_height = 0
 
-    # Add extra height for phase if squat mode and phase info present
+    # Add extra height for phase pill if form_analysis has a phase (all modes)
     show_reps = False
     rep_text = ""
     phase_text = ""
-    if feedback.get('exercise_mode') == 'squat' and feedback.get('form_analysis'):
+    phase_bg_color = None
+    phase_text_color = (255, 255, 255)
+    if feedback.get('form_analysis'):
         fa = feedback['form_analysis']
-        if 'phase' in fa:
-            phase_text = f"Phase: {fa.get('phase','')}"
+        if 'phase' in fa and fa.get('phase'):
+            exercise_mode = feedback.get('exercise_mode', 'squat')
+            current_phase = str(fa.get('phase', '')).lower()
+            phase_text = f"Phase: {current_phase.capitalize()}"
+            # Natural, muted palette per phase (BGR)
+            common_palette = {
+                'ascending': (90, 170, 90),     # muted green
+                'pressing': (90, 170, 90),      # muted green
+                'descending': (60, 160, 255),   # soft amber/orange
+                'lowering': (60, 160, 255),     # soft amber/orange
+                'bottom': (60, 220, 255),       # soft yellow
+                'pause': (180, 180, 180),       # light gray
+                'rest': (200, 200, 200),        # light gray
+                'standing': (200, 200, 200),    # light gray
+                'stable': (200, 200, 200),      # light gray
+            }
+            # Use the common palette for all modes
+            phase_bg_color = common_palette.get(current_phase, (180, 180, 180))
+            # Choose readable text color based on brightness
+            phase_text_color = (0, 0, 0) if sum(phase_bg_color) > 500 else (255, 255, 255)
             extra_height += 28
+        # Rep counters (if present in form analysis for squat/deadlift)
         if any(k in fa for k in ['rep_count', 'correct_rep_count', 'incorrect_rep_count']):
             show_reps = True
             rep_text = f"Reps: {fa.get('rep_count',0)}  Correct: {fa.get('correct_rep_count',0)}  Incorrect: {fa.get('incorrect_rep_count',0)}"
@@ -348,21 +348,22 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 pill_font = cv2.FONT_HERSHEY_SIMPLEX
                 pill_scale = 0.9
                 pill_thickness = 2
-                label = 'GOOD FORM' if (form_analysis.get('depth_status') == 'good' and form_analysis.get('back_status') == 'good') else 'INCORRECT FORM'
+                label = 'CORRECT FORM' if (form_analysis.get('depth_status') == 'good' and form_analysis.get('back_status') == 'good') else 'INCORRECT FORM'
                 text_size = cv2.getTextSize(label, pill_font, pill_scale, pill_thickness)[0]
                 vertical_padding = 8
                 pill_height = text_size[1] + vertical_padding * 2
                 extra_height += pill_height + 16
 
-    # Bench mode: reserve space for phase and depth linesq
-    if feedback.get('exercise_mode') == 'bench' and feedback.get('form_analysis'):
-        extra_height += 26 * 2  # Phase + Depth lines
+    # Bench mode: no extra reserved space unless more lines are actually added later
     
     text_bg_height = base_height + extra_height
     
     # Ensure we don't exceed image bounds and leave some margin
     max_height = min(height * 0.3, 180)  # Increased max height for larger text
-    if text_bg_height > max_height:
+    # For deadlift, keep a fixed overlay height to prevent jitter when messages appear/disappear
+    if feedback.get('exercise_mode') == 'deadlift':
+        text_bg_height = min(int(160), int(max_height))
+    elif text_bg_height > max_height:
         text_bg_height = int(max_height)
     
     # Position overlay with margin from bottom and sides
@@ -382,7 +383,8 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     rep_count = 0
     correct_count = 0
     incorrect_count = 0
-    if feedback.get('exercise_mode') == 'squat' and feedback.get('form_analysis'):
+    # Show rep counter for squat and deadlift modes
+    if feedback.get('exercise_mode') in ['squat', 'deadlift'] and feedback.get('form_analysis'):
         fa = feedback['form_analysis']
         rep_count = fa.get('rep_count', 0)
         correct_count = fa.get('correct_rep_count', 0)
@@ -391,7 +393,8 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         rep_count = feedback.get('rep_count', 0)
         correct_count = feedback.get('correct_rep_count', 0)
         incorrect_count = feedback.get('incorrect_rep_count', 0)
-    rep_counter_active = show_reps or (rep_count > 0 or correct_count > 0 or incorrect_count > 0)
+    # Always show rep counter for deadlift and squat modes
+    rep_counter_active = feedback.get('exercise_mode') in ['squat', 'deadlift', 'bench']
     if rep_counter_active:
         # Bar background color (dark blue-ish)
         bar_color = (80, 86, 106)
@@ -484,8 +487,13 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     # Phase line (if present)
     if phase_text:
         lines.append(phase_text)
-        bg_colors.append((30, 60, 30))
-        text_colors.append((200,255,200))
+        if phase_bg_color is None:
+            # Fallback if not set: use a neutral dark background
+            bg_colors.append((40, 40, 40))
+            text_colors.append((255, 255, 255))
+        else:
+            bg_colors.append(phase_bg_color)
+            text_colors.append(phase_text_color)
     # Main feedback message
     if feedback['message']:
         lines.append(feedback['message'])
@@ -514,29 +522,128 @@ def draw_comprehensive_feedback_overlay(image, feedback):
             return lines
 
         max_text_width = x2 - x1 - 64  # leave some margin inside the box
-        if feedback.get('exercise_mode') in ('squat', 'deadlift'):
+        if feedback.get('exercise_mode') == 'squat':
+            # Helper: map severity string to BGR color
+            def _severity_to_color(sev):
+                # low -> soft yellow, medium -> soft amber, high -> muted red
+                if sev == 'low':
+                    return (60, 220, 255)
+                if sev == 'medium':
+                    return (60, 160, 255)
+                if sev == 'high':
+                    return (0, 0, 200)
+                # default/fallback
+                return (220, 220, 220)
+
+            # Helper: pick highest severity from a set of issue types
+            def _highest_severity(issues, types):
+                rank = {'low': 1, 'medium': 2, 'high': 3}
+                best = None
+                best_r = 0
+                for it in issues or []:
+                    if it.get('type') in types:
+                        sev = it.get('severity')
+                        r = rank.get(sev, 0)
+                        if r > best_r:
+                            best_r = r
+                            best = sev
+                return best
+
+            issues_list = form_analysis.get('issues', [])
+
+            # Back message with severity-based color (fallback to status if no specific issue found)
             if form_analysis.get('back_message') and form_analysis.get('back_status'):
-                back_color = (0, 255, 0) if form_analysis['back_status'] == 'good' else (0, 165, 255)
+                back_sev = _highest_severity(issues_list, {'back_rounding', 'forward_lean_top', 'top_posture'})
+                if back_sev:
+                    back_color = _severity_to_color(back_sev)
+                else:
+                    back_color = (90, 170, 90) if form_analysis['back_status'] == 'good' else (60, 160, 255)
                 wrapped = wrap_text(form_analysis['back_message'], font, font_scale_secondary, thickness_secondary, max_text_width)
                 for wline in wrapped:
                     lines.append(wline)
                     bg_colors.append((40,40,40))
                     text_colors.append(back_color)
+
+            # Depth message with severity-based color (fallback to status if no depth issue found)
             if form_analysis.get('depth_message') and form_analysis.get('depth_status'):
-                if form_analysis['depth_status'] == 'good':
-                    depth_color = (0, 255, 0)
-                elif form_analysis['depth_status'] == 'needs_improvement':
-                    depth_color = (0, 165, 255)
+                depth_sev = _highest_severity(issues_list, {'insufficient_depth'})
+                if depth_sev:
+                    depth_color = _severity_to_color(depth_sev)
                 else:
-                    depth_color = (255, 255, 255)
+                    if form_analysis['depth_status'] == 'good':
+                        depth_color = (90, 170, 90)
+                    elif form_analysis['depth_status'] == 'needs_improvement':
+                        depth_color = (60, 160, 255)
+                    else:
+                        depth_color = (220, 220, 220)
                 wrapped = wrap_text(form_analysis['depth_message'], font, font_scale_secondary, thickness_secondary, max_text_width)
                 for wline in wrapped:
                     lines.append(wline)
                     bg_colors.append((40,40,40))
                     text_colors.append(depth_color)
+        elif feedback.get('exercise_mode') == 'deadlift':
+            # Helper: map severity string to BGR color
+            def _severity_to_color(sev):
+                # low -> soft yellow, medium -> soft amber, high -> muted red
+                if sev == 'low':
+                    return (60, 220, 255)
+                if sev == 'medium':
+                    return (60, 160, 255)
+                if sev == 'high':
+                    return (0, 0, 200)
+                # default/fallback
+                return (220, 220, 220)
+
+            # If hip extension is explicitly good, show a green status line first
+            if form_analysis.get('hip_extension_message') and form_analysis.get('hip_extension_status') == 'good':
+                wrapped = wrap_text(form_analysis['hip_extension_message'], font, font_scale_secondary, thickness_secondary, max_text_width)
+                for wline in wrapped:
+                    lines.append(wline)
+                    bg_colors.append((40,40,40))
+                    text_colors.append((90, 170, 90))  # muted green
+
+            # Prefer structured recommendations with severity
+            recs_detailed = form_analysis.get('recommendations_detailed')
+            if recs_detailed:
+                for entry in recs_detailed:
+                    rec_text = entry.get('text') or ''
+                    sev = entry.get('severity', 'low')
+                    rec_color = _severity_to_color(sev)
+                    wrapped = wrap_text(rec_text, font, font_scale_secondary, thickness_secondary, max_text_width)
+                    for wline in wrapped:
+                        lines.append(wline)
+                        bg_colors.append((40,40,40))
+                        text_colors.append(rec_color)
+            else:
+                # Fallback to existing recommendations list and issue matching
+                recs = form_analysis.get('recommendations', [])
+                all_issues = (form_analysis.get('hip_extension_issues', []) +
+                              form_analysis.get('knee_issues', []) + 
+                              form_analysis.get('spine_issues', []) + 
+                              form_analysis.get('balance_issues', []))
+                for rec in recs:
+                    rec_color = (220, 220, 220)  # default light gray
+                    for issue in all_issues:
+                        if issue.get('recommendation') == rec:
+                            severity = issue.get('severity', 'low')
+                            rec_color = _severity_to_color(severity)
+                            break
+                    wrapped = wrap_text(rec, font, font_scale_secondary, thickness_secondary, max_text_width)
+                    for wline in wrapped:
+                        lines.append(wline)
+                        bg_colors.append((40,40,40))
+                        text_colors.append(rec_color)
         else:
             # For bench or other exercises, keep existing logic if needed
             pass
+
+    # Optionally cap number of lines for deadlift to keep inside fixed box
+    if feedback.get('exercise_mode') == 'deadlift':
+        max_deadlift_lines = 3  # Phase + 2 lines of feedback
+        if len(lines) > max_deadlift_lines:
+            lines = lines[:max_deadlift_lines]
+            bg_colors = bg_colors[:max_deadlift_lines]
+            text_colors = text_colors[:max_deadlift_lines]
 
     # Draw each feedback line with its own background, evenly spaced
     current_y = bg_y_start + y_offset

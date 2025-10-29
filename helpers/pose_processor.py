@@ -30,24 +30,31 @@ class PoseProcessor:
         self.feedback = PoseFeedback()
 
         # Smoothing options
-        self.spatiotemporal_enabled = False  # Spatio temporal smoothing toggle
+        self.spatiotemporal_enabled = True  # Spatio temporal smoothing toggle
         self.kalman_enabled = False  # Kalman filter smoothing toggle
 
         # Pure spatio-temporal smoothing controls
-        self.temporal_alpha = 0.22    # more weight to previous for stability
-        self.spatial_beta = 0.12      # moderate spatial smoothing
+        self.temporal_alpha = 0.35    # Increased weight to previous for more stability
+        self.spatial_beta = 0.25      # Moderate spatial smoothing
         self.conf_threshold = 0.15    # min confidence to trust current point
         self.spatial_min_conf = 0.15  # min confidence to include neighbor
         self._prev_smoothed = None    # (17,3) last smoothed
         # Build adjacency list from skeleton edges
         self._neighbors = self._build_neighbors()
         # Outlier guard history (store last N smoothed frames for robust stats)
-        self._hist_len = 6  # Longer history for better median filtering
+        self._hist_len = 8  # Longer history for smoother median filtering
         self._hist = []  # list of (17,2) arrays of smoothed yx
-        self._mad_k = 4.0  # looser threshold for outlier rejection
-        self._pixel_step_frac = 0.10  # allow more per-frame movement
+        self._mad_k = 3.5  # Tighter threshold for outlier rejection (smoother)
+        self._pixel_step_frac = 0.08  # Reduced per-frame movement for smoother motion
         self.lead_gain = 0.0          # disable lookahead (causes overshoot with noisy data)
         self.last_frame_shape = None
+        
+        # One Euro Filter parameters for adaptive smoothing
+        self._one_euro_enabled = True
+        self._one_euro_filters = None  # Will store filter state per keypoint
+        self._one_euro_min_cutoff = 0.5  # Lower = more smoothing
+        self._one_euro_beta = 0.007  # Speed coefficient - lower = less responsive to speed
+        self._one_euro_dcutoff = 1.0  # Derivative cutoff frequency
 
         # Movement consistency tracking
         self._velocity_history = []  # Track velocity for consistency
@@ -325,6 +332,81 @@ class PoseProcessor:
             pass
         return {i: sorted(list(s)) for i, s in neighbors.items()}
     
+    def _init_one_euro_filters(self):
+        """Initialize One Euro Filter state for each keypoint (x and y separately)."""
+        self._one_euro_filters = []
+        for i in range(17):
+            # Each keypoint gets x and y filters
+            filter_state = {
+                'x': {'prev_val': None, 'prev_dx': 0.0, 'prev_time': None},
+                'y': {'prev_val': None, 'prev_dy': 0.0, 'prev_time': None},
+            }
+            self._one_euro_filters.append(filter_state)
+    
+    def _one_euro_filter_step(self, val, filter_state, timestamp):
+        """Apply One Euro Filter for a single dimension (x or y).
+        
+        One Euro Filter combines exponential smoothing with speed adaptation:
+        - Low speed -> more smoothing (reduces jitter)
+        - High speed -> less smoothing (reduces lag)
+        """
+        if filter_state['prev_val'] is None:
+            # First frame - initialize
+            filter_state['prev_val'] = val
+            filter_state['prev_time'] = timestamp
+            # Initialize derivative based on which dimension we're tracking
+            if 'prev_dx' not in filter_state and 'prev_dy' not in filter_state:
+                filter_state['prev_d'] = 0.0
+            return val
+        
+        # Calculate time delta
+        dt = timestamp - filter_state['prev_time']
+        if dt <= 0:
+            dt = 1.0 / 30.0  # Assume 30fps if time doesn't advance
+        
+        # Estimate current velocity (derivative)
+        if filter_state['prev_val'] is not None:
+            d_val = (val - filter_state['prev_val']) / dt
+        else:
+            d_val = 0.0
+        
+        # Get previous derivative (check both possible keys)
+        if 'prev_dx' in filter_state:
+            prev_d = filter_state['prev_dx']
+        elif 'prev_dy' in filter_state:
+            prev_d = filter_state['prev_dy']
+        else:
+            prev_d = filter_state.get('prev_d', 0.0)
+        
+        # Smooth the derivative
+        alpha_d = self._smoothing_factor(dt, self._one_euro_dcutoff)
+        d_smooth = alpha_d * d_val + (1.0 - alpha_d) * prev_d
+        
+        # Adaptive cutoff based on velocity
+        cutoff = self._one_euro_min_cutoff + self._one_euro_beta * abs(d_smooth)
+        
+        # Smooth the value
+        alpha = self._smoothing_factor(dt, cutoff)
+        val_smooth = alpha * val + (1.0 - alpha) * filter_state['prev_val']
+        
+        # Update state (save to the correct key)
+        filter_state['prev_val'] = val_smooth
+        if 'prev_dx' in filter_state:
+            filter_state['prev_dx'] = d_smooth
+        elif 'prev_dy' in filter_state:
+            filter_state['prev_dy'] = d_smooth
+        else:
+            filter_state['prev_d'] = d_smooth
+        filter_state['prev_time'] = timestamp
+        
+        return val_smooth
+    
+    def _smoothing_factor(self, dt, cutoff):
+        """Calculate exponential smoothing factor for given cutoff frequency."""
+        tau = 1.0 / (2.0 * np.pi * cutoff)
+        alpha = dt / (dt + tau)
+        return alpha
+    
     def get_keypoint_confidence(self, keypoints, kp_idx):
         """Return confidence for a keypoint; kept for API compatibility."""
         try:
@@ -358,42 +440,110 @@ class PoseProcessor:
         return np.zeros(current_kp.shape[0])
     
     def smooth_keypoints_ema(self, keypoints_with_scores):
-        """Pure spatio-temporal smoothing: blend current with previous smoothed (temporal)
-        and neighbor average (spatial). Expects shape (1,1,17,3) with (y,x,score)."""
+        """Enhanced spatio-temporal smoothing with One Euro Filter.
+        
+        Combines:
+        1. One Euro Filter for adaptive temporal smoothing (reduces jitter while maintaining responsiveness)
+        2. Spatial smoothing using neighbor averaging
+        3. Confidence-weighted blending
+        4. Outlier detection and removal
+        
+        Expects shape (1,1,17,3) with (y,x,score).
+        """
         if not self.spatiotemporal_enabled or keypoints_with_scores is None:
             return keypoints_with_scores
 
         kps = keypoints_with_scores[0, 0, :, :].copy()  # (17,3)
+        
+        # Initialize One Euro Filter on first use
+        if self._one_euro_enabled and self._one_euro_filters is None:
+            self._init_one_euro_filters()
+        
         if self._prev_smoothed is None:
             # First frame: initialize
             self._prev_smoothed = kps.copy()
+            if self._one_euro_enabled:
+                # Initialize filter states with first frame values
+                for i in range(17):
+                    self._one_euro_filters[i]['x']['prev_val'] = kps[i, 0]
+                    self._one_euro_filters[i]['y']['prev_val'] = kps[i, 1]
+                    self._one_euro_filters[i]['x']['prev_time'] = 0.0
+                    self._one_euro_filters[i]['y']['prev_time'] = 0.0
             return keypoints_with_scores
 
         conf = kps[:, 2].copy()
         prev = self._prev_smoothed.copy()
-        alphaT = float(self.temporal_alpha)
-        betaS = float(self.spatial_beta)
-        gammaC = max(0.0, 1.0 - alphaT - betaS)  # weight for current
+        
+        # Generate synthetic timestamp (could be replaced with actual timestamps if available)
+        import time
+        current_time = time.time()
+        
+        # Apply One Euro Filter for temporal smoothing (if enabled)
+        if self._one_euro_enabled:
+            for i in range(17):
+                # Only apply filter if confidence is reasonable
+                if conf[i] > self.conf_threshold:
+                    kps[i, 0] = self._one_euro_filter_step(
+                        kps[i, 0], 
+                        self._one_euro_filters[i]['x'], 
+                        current_time
+                    )
+                    kps[i, 1] = self._one_euro_filter_step(
+                        kps[i, 1], 
+                        self._one_euro_filters[i]['y'], 
+                        current_time
+                    )
+                else:
+                    # Low confidence - use previous smoothed value
+                    kps[i, 0] = prev[i, 0]
+                    kps[i, 1] = prev[i, 1]
+        else:
+            # Fallback to basic EMA if One Euro Filter is disabled
+            alphaT = float(self.temporal_alpha)
+            betaS = float(self.spatial_beta)
+            gammaC = max(0.0, 1.0 - alphaT - betaS)  # weight for current
 
-        # Compute neighbor averages for spatial term
-        neigh_avg = np.zeros((17, 2), dtype=np.float32)
-        for i in range(17):
-            neigh = self._neighbors.get(i, [])
-            pts = []
-            for j in neigh:
-                pts.append([kps[j, 0], kps[j, 1]])
-            if pts:
-                pts_arr = np.array(pts, dtype=np.float32)
-                neigh_avg[i, 0] = float(np.mean(pts_arr[:, 0]))
-                neigh_avg[i, 1] = float(np.mean(pts_arr[:, 1]))
-            else:
-                neigh_avg[i, 0] = prev[i, 0]
-                neigh_avg[i, 1] = prev[i, 1]
+            # Compute neighbor averages for spatial term
+            neigh_avg = np.zeros((17, 2), dtype=np.float32)
+            for i in range(17):
+                neigh = self._neighbors.get(i, [])
+                pts = []
+                for j in neigh:
+                    if conf[j] >= self.spatial_min_conf:  # Only use confident neighbors
+                        pts.append([kps[j, 0], kps[j, 1]])
+                if pts:
+                    pts_arr = np.array(pts, dtype=np.float32)
+                    neigh_avg[i, 0] = float(np.mean(pts_arr[:, 0]))
+                    neigh_avg[i, 1] = float(np.mean(pts_arr[:, 1]))
+                else:
+                    neigh_avg[i, 0] = prev[i, 0]
+                    neigh_avg[i, 1] = prev[i, 1]
 
-        # Basic EMA smoothing: blend current, previous, and neighbor average
-        for i in range(17):
-            kps[i, 0] = gammaC * kps[i, 0] + alphaT * prev[i, 0] + betaS * neigh_avg[i, 0]
-            kps[i, 1] = gammaC * kps[i, 1] + alphaT * prev[i, 1] + betaS * neigh_avg[i, 1]
+            # Confidence-weighted blending: blend current, previous, and neighbor average
+            for i in range(17):
+                if conf[i] >= self.conf_threshold:
+                    # Use confidence to adjust blending weights
+                    conf_weight = min(conf[i], 0.8)  # Cap confidence influence
+                    temp_weight = alphaT * (1.0 + (1.0 - conf_weight) * 0.5)  # More previous if low conf
+                    spat_weight = betaS
+                    curr_weight = max(0.1, 1.0 - temp_weight - spat_weight)  # Ensure some current weight
+                    
+                    kps[i, 0] = curr_weight * kps[i, 0] + temp_weight * prev[i, 0] + spat_weight * neigh_avg[i, 0]
+                    kps[i, 1] = curr_weight * kps[i, 1] + temp_weight * prev[i, 1] + spat_weight * neigh_avg[i, 1]
+                else:
+                    # Very low confidence - heavily favor previous position
+                    kps[i, 0] = 0.1 * kps[i, 0] + 0.9 * prev[i, 0]
+                    kps[i, 1] = 0.1 * kps[i, 1] + 0.9 * prev[i, 1]
+
+        # Apply outlier guard with updated keypoints
+        kps_yx = kps[:, 0:2].copy()
+        prev_yx = prev[:, 0:2].copy()
+        kps_yx = self._apply_outlier_guard(kps_yx, prev_yx, keypoints_with_scores)
+        
+        # Apply torso constraints for realistic body proportions
+        kps_yx = self._apply_torso_constraints(kps_yx, prev_yx, conf)
+        
+        kps[:, 0:2] = kps_yx
 
         # Update prev smoothed and history
         self._prev_smoothed[:, 0:2] = kps[:, 0:2]
@@ -476,7 +626,11 @@ class PoseProcessor:
             return yx
 
     def _apply_outlier_guard(self, yx, prev_yx, keypoints_with_scores):
-        """Strict outlier detection to prevent jitter from noisy MoveNet detections."""
+        """Improved outlier detection with smoother transitions.
+        
+        Uses MAD (Median Absolute Deviation) for robust outlier detection,
+        but applies gradual clamping instead of hard rejection for smoother motion.
+        """
         try:
             # Get confidence scores
             conf = keypoints_with_scores[0, 0, :, 2]
@@ -484,36 +638,56 @@ class PoseProcessor:
             # Normalized per-frame movement cap
             pixel_cap_norm = float(self._pixel_step_frac)
 
-            # Strict MAD-based outlier detection with sufficient history
-            if len(self._hist) >= 4:  # Need less history for faster response
+            # Smoother MAD-based outlier detection with sufficient history
+            if len(self._hist) >= 5:  # Reduced from 4 for more stable median
                 hist_stack = np.stack(self._hist, axis=0)  # (T,17,2)
                 med = np.median(hist_stack, axis=0)
                 mad = np.median(np.abs(hist_stack - med), axis=0) + 1e-6
                 
                 diff = yx - med
                 
-                # Apply strict MAD filtering
+                # Apply gradual MAD filtering for smoother motion
                 for i in range(17):
                     deviation = np.abs(diff[i]) / mad[i]
                     
-                    # If deviation is extreme and confidence is not very high, clamp it
-                    if np.any(deviation > self._mad_k):
-                        if conf[i] < 0.65:  # Lowered from 0.7 for more responsiveness
-                            # Clamp to MAD boundary
-                            yx[i] = med[i] + np.sign(diff[i]) * np.minimum(np.abs(diff[i]), self._mad_k * mad[i])
+                    # Use confidence-adaptive thresholding
+                    conf_factor = 1.0 + (1.0 - conf[i]) * 2.0  # Higher threshold for low conf
+                    adaptive_mad_k = self._mad_k * conf_factor
+                    
+                    # Gradual clamping instead of hard rejection
+                    if np.any(deviation > adaptive_mad_k):
+                        if conf[i] < 0.70:
+                            # Soft clamp: gradually pull back outliers
+                            max_allowed_dev = adaptive_mad_k * mad[i]
+                            for dim in range(2):
+                                if abs(diff[i, dim]) > max_allowed_dev[dim]:
+                                    # Use exponential decay for smooth transition
+                                    excess = abs(diff[i, dim]) - max_allowed_dev[dim]
+                                    reduction = excess * 0.7  # Reduce 70% of excess
+                                    yx[i, dim] = med[i, dim] + np.sign(diff[i, dim]) * (max_allowed_dev[dim] + excess - reduction)
 
-            # Per-frame step clamp - stricter for low confidence
+            # Confidence-adaptive per-frame step clamp with smooth scaling
             delta = yx - prev_yx
             for i in range(17):
-                # Scale cap based on confidence
-                if conf[i] > 0.65:
-                    cap = pixel_cap_norm * 4.0  # Allow large movement for high confidence
-                elif conf[i] > 0.45:
-                    cap = pixel_cap_norm * 2.0  # Moderate movement for medium confidence
+                # Smooth confidence-based scaling curve
+                if conf[i] > 0.70:
+                    cap = pixel_cap_norm * 5.0  # Allow larger movement for very high confidence
+                elif conf[i] > 0.50:
+                    # Smooth interpolation between medium and high
+                    interp = (conf[i] - 0.50) / 0.20
+                    cap = pixel_cap_norm * (2.5 + interp * 2.5)
+                elif conf[i] > 0.30:
+                    # Smooth interpolation between low and medium
+                    interp = (conf[i] - 0.30) / 0.20
+                    cap = pixel_cap_norm * (1.0 + interp * 1.5)
                 else:
-                    cap = pixel_cap_norm * 0.6  # Restrictive for low confidence (likely noise)
+                    cap = pixel_cap_norm * 0.8  # Restrictive for very low confidence
                 
-                delta[i] = np.clip(delta[i], -cap, cap)
+                # Apply smooth clamping
+                for dim in range(2):
+                    if abs(delta[i, dim]) > cap:
+                        # Soft clamp with smooth transition
+                        delta[i, dim] = np.sign(delta[i, dim]) * (cap + (abs(delta[i, dim]) - cap) * 0.2)
             
             yx = prev_yx + delta
             return yx

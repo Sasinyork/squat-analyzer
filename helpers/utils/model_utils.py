@@ -28,11 +28,9 @@ def load_movenet_model(custom_model_path=None):
     resolve_time = time.time() - resolve_start
     print(f"Model path resolved in {resolve_time:.2f} seconds")
     
-    print("Loading SavedModel...")
     load_start = time.time()
     module = tf.saved_model.load(resolved_path)
     load_time = time.time() - load_start
-    print(f"SavedModel loaded in {load_time:.2f} seconds")
     
     serving_fn = module.signatures["serving_default"]
 
