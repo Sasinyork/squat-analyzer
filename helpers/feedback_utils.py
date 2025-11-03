@@ -354,15 +354,33 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 pill_height = text_size[1] + vertical_padding * 2
                 extra_height += pill_height + 16
 
-    # Bench mode: no extra reserved space unless more lines are actually added later
+    # Bench mode: allocate extra space for form feedback issues
+    if feedback.get('exercise_mode') == 'bench' and feedback.get('form_analysis'):
+        issues_list = feedback['form_analysis'].get('issues', [])
+        if issues_list:
+            # Each issue can have message + recommendation which may wrap to multiple lines
+            # Estimate based on number of issues and average line length
+            max_chars_per_line = 50  # Bench feedback tends to be longer
+            for issue in issues_list:
+                message = issue.get('message', '')
+                recommendation = issue.get('recommendation', '')
+                full_text = f"{message} - {recommendation}" if recommendation else message
+                estimated_lines = max(1, len(full_text) // max_chars_per_line + 1)
+                extra_height += (estimated_lines * 26) + 8  # 26px per line + 8px spacing
+        else:
+            # "Form looks good!" message
+            extra_height += 30
     
     text_bg_height = base_height + extra_height
     
     # Ensure we don't exceed image bounds and leave some margin
-    max_height = min(height * 0.3, 180)  # Increased max height for larger text
+    max_height = min(height * 0.35, 220)  # Increased max height for bench press (was 0.3, 180)
     # For deadlift, keep a fixed overlay height to prevent jitter when messages appear/disappear
     if feedback.get('exercise_mode') == 'deadlift':
         text_bg_height = min(int(160), int(max_height))
+    elif feedback.get('exercise_mode') == 'bench':
+        # For bench, allow more height for form feedback
+        text_bg_height = min(int(text_bg_height), int(max_height))
     elif text_bg_height > max_height:
         text_bg_height = int(max_height)
     
@@ -633,8 +651,44 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                         lines.append(wline)
                         bg_colors.append((40,40,40))
                         text_colors.append(rec_color)
+        elif feedback.get('exercise_mode') == 'bench':
+            # Bench press form feedback with severity-based colors
+            def _severity_to_color(sev):
+                # low -> soft yellow, medium -> soft amber, high -> muted red
+                if sev == 'low':
+                    return (60, 220, 255)
+                if sev == 'medium':
+                    return (60, 160, 255)
+                if sev == 'high':
+                    return (0, 0, 200)
+                # default/fallback
+                return (220, 220, 220)
+            
+            # Get issues from form analysis
+            issues_list = form_analysis.get('issues', [])
+            
+            # Display each issue with its severity-based color
+            for issue in issues_list:
+                message = issue.get('message', '')
+                recommendation = issue.get('recommendation', '')
+                severity = issue.get('severity', 'low')
+                issue_color = _severity_to_color(severity)
+                
+                # Display message and recommendation together
+                full_text = f"{message} - {recommendation}" if recommendation else message
+                wrapped = wrap_text(full_text, font, font_scale_secondary, thickness_secondary, max_text_width)
+                for wline in wrapped:
+                    lines.append(wline)
+                    bg_colors.append((40,40,40))
+                    text_colors.append(issue_color)
+            
+            # If no issues, show a positive feedback message
+            if not issues_list:
+                lines.append("Form looks good!")
+                bg_colors.append((40,40,40))
+                text_colors.append((90, 170, 90))  # muted green
         else:
-            # For bench or other exercises, keep existing logic if needed
+            # For other exercises, keep existing logic if needed
             pass
 
     # Optionally cap number of lines for deadlift to keep inside fixed box

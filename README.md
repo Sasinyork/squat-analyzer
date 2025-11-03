@@ -7,7 +7,7 @@ A real-time pose detection and form analysis app powered by Google’s MoveNet L
 ### Supported Exercises (with phase detection)
 
 - Squat: standing → descending → bottom → ascending
-- Bench Press: rest/pause → lowering → bottom → pressing → stable
+- Bench Press: stable → descending → bottom → ascending
 - Deadlift: standing → descending → bottom → ascending
 
 ### Core Analysis Capabilities
@@ -46,7 +46,7 @@ A real-time pose detection and form analysis app powered by Google’s MoveNet L
 - Bench Press
 
   - Rotated-keypoint analysis for lying position (consistent “depth” trend)
-  - Smoothed keypoints and stable/pressing/lowering detection
+  - Smoothed keypoints and phase detection (stable, descending, bottom, ascending)
   - Unified Phase pill and rep counter UI
 
 - Deadlift
