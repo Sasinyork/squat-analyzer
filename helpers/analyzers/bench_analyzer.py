@@ -21,6 +21,20 @@ class BenchPressFormAnalyzer:
             'ascending': 5
         }
         
+        # Rep counting state (mirroring squat and deadlift analyzers)
+        self.rep_count = 0
+        self.correct_rep_count = 0
+        self.incorrect_rep_count = 0
+        self._rep_state = {
+            'in_rep': False,
+            'bottom_reached': False,
+            'issues_at_bottom': [],
+        }
+        self._last_bottom_issues = []  # Store issues at last bottom phase for rep correctness
+        self._phase_queue = []  # Track last N phases
+        self._max_phase_queue = 5
+        self._last_phase = None
+        
         # Phase detection parameters
         self.max_history = 10  # Number of frames to track for movement
         self.movement_threshold = 0.6  # Minimum pixel movement to detect direction (legacy, not used in new FSM)
@@ -547,65 +561,89 @@ class BenchPressFormAnalyzer:
             wrist_pt = right_wrist
             hip_pt = right_hip if right_hip else None
         
-        # 1. Elbow flare angle during descending/bottom phase
-        # Calculate angle between shoulder-elbow line and torso line (shoulder-hip)
-        if phase in ['descending', 'bottom'] and hip_pt:
-            # Vector from shoulder to elbow
-            se_vec = np.array([elbow_pt[0] - shoulder_pt[0], elbow_pt[1] - shoulder_pt[1]])
-            # Vector from shoulder to hip (torso)
-            sh_vec = np.array([hip_pt[0] - shoulder_pt[0], hip_pt[1] - shoulder_pt[1]])
-            
-            # Calculate angle between vectors
-            cos_angle = np.dot(se_vec, sh_vec) / (np.linalg.norm(se_vec) * np.linalg.norm(sh_vec) + 1e-6)
-            cos_angle = np.clip(cos_angle, -1.0, 1.0)
-            elbow_flare_angle = np.degrees(np.arccos(cos_angle))
-            
-            # Ideal range: 45-75° from torso
-            if elbow_flare_angle > 85:  # Too much flare (approaching 90°)
-                issues.append({
-                    'type': 'elbow_flare',
-                    'severity': 'high',
-                    'message': 'Elbows flaring too wide',
-                    'recommendation': 'Tuck elbows to 45-75deg angle',
-                    'angle': elbow_flare_angle
-                })
-            elif elbow_flare_angle < 35:  # Too tucked
-                issues.append({
-                    'type': 'elbow_tuck_excessive',
-                    'severity': 'medium',
-                    'message': 'Elbows too tucked',
-                    'recommendation': 'Allow elbows to be at 45-75deg angle',
-                    'angle': elbow_flare_angle
-                })
-            elif 75 < elbow_flare_angle <= 85:  # Moderate flare
-                issues.append({
-                    'type': 'elbow_flare_moderate',
-                    'severity': 'medium',
-                    'message': 'Elbows slightly wide',
-                    'recommendation': 'Tuck elbows slightly more',
-                    'angle': elbow_flare_angle
-                })
-        
-        # 2. Forearm verticality at bottom position
+        # 1. Elbow angle at bottom position (side view specific)
+        # From side view, we can measure the elbow bend angle (shoulder-elbow-wrist)
+        # This tells us about proper bar path and depth
         if phase == 'bottom':
-            # Forearm should be perpendicular to ground (vertical)
-            # Calculate angle of forearm from vertical
-            forearm_vec = np.array([wrist_pt[0] - elbow_pt[0], wrist_pt[1] - elbow_pt[1]])
-            vertical_vec = np.array([0, 1])  # Downward vertical
+            # Calculate elbow angle at bottom position
+            elbow_angle = self.calculate_angle(shoulder_pt, elbow_pt, wrist_pt)
             
-            cos_angle = np.dot(forearm_vec, vertical_vec) / (np.linalg.norm(forearm_vec) + 1e-6)
-            cos_angle = np.clip(cos_angle, -1.0, 1.0)
-            forearm_angle_from_vertical = np.degrees(np.arccos(cos_angle))
+            if elbow_angle is not None:
+                # At bottom, elbows can go quite deep (45-100°) when bar touches chest
+                # Deeper angles are normal and good for full ROM
+                if elbow_angle < 35:  # Extremely acute angle (likely detection error)
+                    issues.append({
+                        'type': 'elbow_angle_detection_issue',
+                        'severity': 'low',
+                        'message': 'Unusual elbow angle detected',
+                        'recommendation': 'Likely a detection error - ignore if form feels good',
+                        'angle': elbow_angle
+                    })
+                elif elbow_angle < 50:  # Very deep ROM (normal for some lifters)
+                    issues.append({
+                        'type': 'elbow_angle_very_deep',
+                        'severity': 'low',
+                        'message': 'Very deep range of motion',
+                        'recommendation': 'Good if comfortable and controlled',
+                        'angle': elbow_angle
+                    })
+                elif elbow_angle > 120:  # Not deep enough (insufficient depth)
+                    issues.append({
+                        'type': 'insufficient_depth',
+                        'severity': 'high',
+                        'message': 'Bar not lowered enough',
+                        'recommendation': 'Lower bar closer to chest',
+                        'angle': elbow_angle
+                    })
+                elif elbow_angle > 100:  # Slightly insufficient depth
+                    issues.append({
+                        'type': 'depth_slightly_high',
+                        'severity': 'medium',
+                        'message': 'Bar could go slightly lower',
+                        'recommendation': 'Touch bar to chest',
+                        'angle': elbow_angle
+                    })
+                # 50-100° is normal range at bottom (wide range accounts for different builds/grip widths)
+        
+        # 2. Wrist-elbow alignment at bottom position
+        if phase == 'bottom':
+            # Wrist should be stacked over elbow for proper force transfer
+            # Calculate horizontal distance between wrist and elbow
+            wrist_elbow_horizontal_offset = abs(wrist_pt[0] - elbow_pt[0])
             
-            # Allow some tolerance (15° from vertical)
-            if forearm_angle_from_vertical > 25:  # Forearm not vertical enough
-                issues.append({
-                    'type': 'forearm_not_vertical',
-                    'severity': 'medium',
-                    'message': 'Forearms not vertical at bottom',
-                    'recommendation': 'Keep forearms perpendicular to ground',
-                    'angle': forearm_angle_from_vertical
-                })
+            # Calculate forearm length for relative measurement
+            forearm_length = np.sqrt((wrist_pt[0] - elbow_pt[0])**2 + (wrist_pt[1] - elbow_pt[1])**2)
+            
+            # Calculate offset as percentage of forearm length
+            if forearm_length > 0:
+                offset_percentage = (wrist_elbow_horizontal_offset / forearm_length) * 100
+                
+                # Graduated severity based on wrist-elbow misalignment
+                if offset_percentage > 40:  # Severely misaligned (wrist far from elbow)
+                    issues.append({
+                        'type': 'wrist_elbow_alignment',
+                        'severity': 'high',
+                        'message': 'Wrist not aligned with elbow',
+                        'recommendation': 'Stack wrist directly over elbow',
+                        'offset_percentage': offset_percentage
+                    })
+                elif offset_percentage > 25:  # Moderately misaligned
+                    issues.append({
+                        'type': 'wrist_elbow_alignment',
+                        'severity': 'medium',
+                        'message': 'Wrist slightly off elbow alignment',
+                        'recommendation': 'Adjust wrist position over elbow',
+                        'offset_percentage': offset_percentage
+                    })
+                elif offset_percentage > 15:  # Slightly misaligned
+                    issues.append({
+                        'type': 'wrist_elbow_alignment',
+                        'severity': 'low',
+                        'message': 'Wrist could be better aligned',
+                        'recommendation': 'Minor wrist adjustment needed',
+                        'offset_percentage': offset_percentage
+                    })
+                # If <= 15%, wrist-elbow alignment is good, no issue reported
         
         # 3. Elbow lockout at top (stable phase)
         if phase == 'stable':
@@ -656,13 +694,65 @@ class BenchPressFormAnalyzer:
         arm_issues = self.analyze_arm_elbow_mechanics(keypoints, image_height, image_width, phase)
         form_issues.extend(arm_issues)
         
-        # Return analysis with smoothed and rotated keypoints plus form issues
+        # --- REP COUNTING LOGIC (mirroring squat and deadlift analyzers) ---
+        # Track last N phases
+        if not self._phase_queue or self._phase_queue[-1] != phase:
+            self._phase_queue.append(phase)
+            if len(self._phase_queue) > self._max_phase_queue:
+                self._phase_queue.pop(0)
+
+        # Store issues at bottom phase for rep correctness
+        if phase == "bottom":
+            self._last_bottom_issues = [issue for issue in form_issues if issue.get('severity') == 'high']
+
+        # More robust rep detection: allow a single 'stable' or None placeholder in the sequence
+        def matches_expected(seq, expected):
+            """Check if sequence matches expected, allowing one 'stable' or None placeholder."""
+            if len(seq) != len(expected):
+                return False
+            for i, (actual, exp) in enumerate(zip(seq, expected)):
+                if actual != exp:
+                    # Allow None or 'stable' as wildcard only once
+                    if actual in [None, 'stable'] and i > 0:
+                        continue
+                    return False
+            return True
+
+        expected_seq = ["stable", "descending", "bottom", "ascending", "stable"]
+        # Only increment rep if last detected rep was not just counted
+        if len(self._phase_queue) >= 5 and matches_expected(self._phase_queue[-5:], expected_seq):
+            if not self._rep_state['in_rep']:
+                self._rep_state['in_rep'] = True
+                self.rep_count += 1
+                
+                # Check if rep was correct (no high-severity issues at bottom)
+                if not self._last_bottom_issues:
+                    self.correct_rep_count += 1
+                else:
+                    self.incorrect_rep_count += 1
+                
+                # Clear the phase queue to prevent counting the same rep multiple times
+                self._phase_queue.clear()
+                self._phase_queue.append(phase)  # Add current phase to start new sequence
+                
+                # Reset rep state after counting
+                self._rep_state['in_rep'] = False
+                self._rep_state['bottom_reached'] = False
+        else:
+            self._rep_state['in_rep'] = False
+
+        self._last_phase = phase
+        
+        # Return analysis with smoothed and rotated keypoints plus form issues and rep counts
         analysis = {
             'phase': phase,
             'phase_frames': self.phase_frames,
             'depth_metric': depth_metric,
             'keypoints': final_keypoints,
-            'issues': form_issues
+            'issues': form_issues,
+            'rep_count': self.rep_count,
+            'correct_rep_count': self.correct_rep_count,
+            'incorrect_rep_count': self.incorrect_rep_count,
         }
         
         return analysis
