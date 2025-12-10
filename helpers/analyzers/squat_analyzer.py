@@ -701,6 +701,15 @@ class SquatFormAnalyzer:
             feedback['back_status'] = 'good'
             feedback['back_message'] = 'Good back position - neutral spine maintained'
 
+        # Add positive feedback if no specific feedback and no issues
+        if not show_depth_feedback and not back_issues and not all_issues:
+            if phase == "standing":
+                feedback['recommendations'] = ["Good form!"]
+            elif phase == "descending":
+                feedback['recommendations'] = ["Controlled descent - keep it up!"]
+            elif phase == "ascending":
+                feedback['recommendations'] = ["Strong drive up!"]
+
         self.feedback_history.append(feedback)
         if len(self.feedback_history) > 10:
             self.feedback_history.pop(0)

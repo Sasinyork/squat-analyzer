@@ -73,6 +73,26 @@ EDGE_COLORS = {
     (14, 16): (255, 255, 0)  # Cyan
 }
 
+def calculate_visualization_scale(height, width):
+    """Calculate scale factor for visualization elements based on video resolution.
+    
+    Uses 1080x1920 (portrait) as the baseline reference resolution.
+    Returns a scale factor for keypoint sizes, line thicknesses, etc.
+    """
+    # Reference resolution (1080 width x 1920 height for portrait videos)
+    reference_width = 1080
+    reference_height = 1920
+    
+    # Calculate scale based on the smaller dimension
+    if height > width:
+        # Portrait orientation
+        scale = width / reference_width
+    else:
+        # Landscape orientation - use height as reference
+        scale = height / reference_height
+    
+    return max(0.5, min(scale, 3.0))  # Clamp between 0.5x and 3x
+
 def _keypoints_and_edges_for_display(keypoints_with_scores,
                                      height,
                                      width,
@@ -220,6 +240,9 @@ def draw_prediction_on_image_enhanced(image, keypoints_with_scores, keypoint_thr
     """Enhanced version with improved keypoint detection and visibility for squat analysis."""
     height, width, _ = image.shape
     
+    # Calculate visualization scale based on image dimensions
+    viz_scale = calculate_visualization_scale(height, width)
+    
     # Extract keypoints
     keypoints = keypoints_with_scores[0, 0, :, :]  # Shape: (17, 3)
     
@@ -265,14 +288,14 @@ def draw_prediction_on_image_enhanced(image, keypoints_with_scores, keypoint_thr
             
             # Enhanced circle size based on confidence and body part importance
             if i in core_keypoints:
-                radius = int(4 + confidence * 6)  # Larger for core parts
-                thickness = 3
+                radius = int((4 + confidence * 6) * viz_scale)  # Larger for core parts
+                thickness = max(1, int(3 * viz_scale))
             elif i in upper_body_keypoints:
-                radius = int(3 + confidence * 4)  # Medium for upper body
-                thickness = 2
+                radius = int((3 + confidence * 4) * viz_scale)  # Medium for upper body
+                thickness = max(1, int(2 * viz_scale))
             else:
-                radius = int(2 + confidence * 3)  # Smaller for extremities
-                thickness = 1
+                radius = int((2 + confidence * 3) * viz_scale)  # Smaller for extremities
+                thickness = max(1, int(1 * viz_scale))
             
             # Enhanced color coding based on body part importance for squat analysis
             if i in [0, 1, 2, 3, 4]:  # Head
@@ -327,7 +350,7 @@ def draw_prediction_on_image_enhanced(image, keypoints_with_scores, keypoint_thr
             
             # Enhanced line thickness based on confidence
             avg_confidence = (confidence1 + confidence2) / 2
-            thickness = max(2, int(avg_confidence * 4))
+            thickness = max(1, int(avg_confidence * 4 * viz_scale))
             
             cv2.line(image, (x1, y1), (x2, y2), color, thickness)
     
@@ -336,6 +359,9 @@ def draw_prediction_on_image_enhanced(image, keypoints_with_scores, keypoint_thr
 def draw_prediction_on_image_adaptive(image, keypoints_with_scores, keypoint_threshold=0.15):
     """Enhanced version that handles close range and raised arms better."""
     height, width, _ = image.shape
+    
+    # Calculate scale factor for this video resolution
+    viz_scale = calculate_visualization_scale(height, width)
     
     # Extract keypoints
     keypoints = keypoints_with_scores[0, 0, :, :]  # Shape: (17, 3)
@@ -384,9 +410,9 @@ def draw_prediction_on_image_adaptive(image, keypoints_with_scores, keypoint_thr
             
             # Adjust circle size based on confidence and body part
             if i in extremity_keypoints:
-                radius = int(2 + confidence * 3)  # Smaller for extremities
+                radius = int((2 + confidence * 3) * viz_scale)  # Smaller for extremities
             else:
-                radius = int(3 + confidence * 4)  # Normal size for core parts
+                radius = int((3 + confidence * 4) * viz_scale)  # Normal size for core parts
             
             # Color coding based on body part
             if i in [0, 1, 2, 3, 4]:  # Head
@@ -401,7 +427,7 @@ def draw_prediction_on_image_adaptive(image, keypoints_with_scores, keypoint_thr
             # Only draw if keypoint is reasonably within bounds
             if 0 <= x < width and 0 <= y < height:
                 cv2.circle(image, (x, y), radius, color, -1)
-                cv2.circle(image, (x, y), radius, (255, 255, 255), 1)
+                cv2.circle(image, (x, y), radius, (255, 255, 255), max(1, int(1 * viz_scale)))
     
     # Draw edges with adaptive logic
     torso_set = {5, 6, 11, 12}
@@ -441,7 +467,7 @@ def draw_prediction_on_image_adaptive(image, keypoints_with_scores, keypoint_thr
             
             # Only draw edge if at least one endpoint is within bounds
             if (0 <= x1 < width and 0 <= y1 < height) or (0 <= x2 < width and 0 <= y2 < height):
-                thickness = max(2, int((confidence1 + confidence2) / 2 * 3))
+                thickness = max(1, int((confidence1 + confidence2) / 2 * 3 * viz_scale))
                 cv2.line(image, (x1, y1), (x2, y2), color, thickness)
     
     return image
@@ -449,6 +475,9 @@ def draw_prediction_on_image_adaptive(image, keypoints_with_scores, keypoint_thr
 def draw_prediction_on_image_simple(image, keypoints_with_scores, keypoint_threshold=0.15):
     """Simple version optimized for close-medium range."""
     height, width, _ = image.shape
+    
+    # Calculate scale factor for this video resolution
+    viz_scale = calculate_visualization_scale(height, width)
     
     # Extract keypoints
     keypoints = keypoints_with_scores[0, 0, :, :]  # Shape: (17, 3)
@@ -482,7 +511,7 @@ def draw_prediction_on_image_simple(image, keypoints_with_scores, keypoint_thres
             y = max(-5, min(height + 5, y))
             
             # Adjust circle size based on confidence
-            radius = int(3 + confidence * 4)
+            radius = int((3 + confidence * 4) * viz_scale)
             
             # Use different colors for different body parts
             if i in [0, 1, 2, 3, 4]:  # Head keypoints
@@ -497,7 +526,7 @@ def draw_prediction_on_image_simple(image, keypoints_with_scores, keypoint_thres
             # Only draw if keypoint is within reasonable bounds
             if 0 <= x < width and 0 <= y < height:
                 cv2.circle(image, (x, y), radius, color, -1)
-                cv2.circle(image, (x, y), radius, (255, 255, 255), 1)
+                cv2.circle(image, (x, y), radius, (255, 255, 255), max(1, int(1 * viz_scale)))
     
     # Draw edges
     for edge_pair, color in EDGE_COLORS.items():
@@ -531,7 +560,7 @@ def draw_prediction_on_image_simple(image, keypoints_with_scores, keypoint_thres
             
             # Only draw if at least one endpoint is within bounds
             if (0 <= x1 < width and 0 <= y1 < height) or (0 <= x2 < width and 0 <= y2 < height):
-                thickness = max(2, int((confidence1 + confidence2) / 2 * 3))
+                thickness = max(1, int((confidence1 + confidence2) / 2 * 3 * viz_scale))
                 cv2.line(image, (x1, y1), (x2, y2), color, thickness)
     
     return image
@@ -539,6 +568,9 @@ def draw_prediction_on_image_simple(image, keypoints_with_scores, keypoint_thres
 def draw_prediction_on_image_bench_press(image, keypoints_with_scores, keypoint_threshold=0.15):
     """Specialized visualization for bench press analysis with enhanced lower body detection."""
     height, width, _ = image.shape
+    
+    # Calculate scale factor for this video resolution
+    viz_scale = calculate_visualization_scale(height, width)
     
     # Extract keypoints
     keypoints = keypoints_with_scores[0, 0, :, :]  # Shape: (17, 3)
@@ -587,14 +619,14 @@ def draw_prediction_on_image_bench_press(image, keypoints_with_scores, keypoint_
             
             # Adjust circle size based on confidence and body part
             if i in ankle_keypoints:
-                radius = int(3 + confidence * 5)  # Larger for ankles to make them more visible
-                thickness = 2
+                radius = int((3 + confidence * 5) * viz_scale)  # Larger for ankles to make them more visible
+                thickness = max(1, int(2 * viz_scale))
             elif i in knee_keypoints:
-                radius = int(3 + confidence * 4)
-                thickness = 2
+                radius = int((3 + confidence * 4) * viz_scale)
+                thickness = max(1, int(2 * viz_scale))
             else:
-                radius = int(2 + confidence * 3)
-                thickness = 1
+                radius = int((2 + confidence * 3) * viz_scale)
+                thickness = max(1, int(1 * viz_scale))
             
             # Enhanced color coding for bench press analysis
             if i in [0, 1, 2, 3, 4]:  # Head
@@ -614,8 +646,8 @@ def draw_prediction_on_image_bench_press(image, keypoints_with_scores, keypoint_
             # Always draw keypoints, even if they're outside bounds (important for bench press)
             if i in ankle_keypoints:
                 # Draw a larger, more visible circle for ankles
-                cv2.circle(image, (x, y), radius + 2, color, -1)
-                cv2.circle(image, (x, y), radius + 2, (255, 255, 255), thickness + 1)
+                cv2.circle(image, (x, y), int((radius + 2) * viz_scale), color, -1)
+                cv2.circle(image, (x, y), int((radius + 2) * viz_scale), (255, 255, 255), max(1, int((thickness + 1) * viz_scale)))
             else:
                 cv2.circle(image, (x, y), radius, color, -1)
                 cv2.circle(image, (x, y), radius, (255, 255, 255), thickness)
@@ -658,11 +690,11 @@ def draw_prediction_on_image_bench_press(image, keypoints_with_scores, keypoint_
             # Enhanced line thickness for lower body edges
             avg_confidence = (confidence1 + confidence2) / 2
             if edge_pair[0] in ankle_keypoints or edge_pair[1] in ankle_keypoints:
-                thickness = max(4, int(avg_confidence * 6))  # Thicker lines for ankle connections
+                thickness = max(1, int(avg_confidence * 6 * viz_scale))  # Thicker lines for ankle connections
             elif edge_pair[0] in lower_body_keypoints or edge_pair[1] in lower_body_keypoints:
-                thickness = max(3, int(avg_confidence * 5))  # Medium thickness for lower body
+                thickness = max(1, int(avg_confidence * 5 * viz_scale))  # Medium thickness for lower body
             else:
-                thickness = max(2, int(avg_confidence * 3))  # Normal thickness for upper body
+                thickness = max(1, int(avg_confidence * 3 * viz_scale))  # Normal thickness for upper body
             
             # Always draw edges, even if they extend beyond bounds (important for bench press)
             cv2.line(image, (x1, y1), (x2, y2), color, thickness)

@@ -1,6 +1,31 @@
 #!/usr/bin/env python3
 """
 Main.py with proper orientation handling and angle display.
+
+OCCLUSION HANDLING USAGE:
+-------------------------
+The PoseProcessor now includes comprehensive occlusion handling with side mirroring
+for side-view videos. The system can be toggled on/off:
+
+# Enable occlusion handling with side mirroring (default: True)
+processor.occlusion_handling_enabled = True
+processor._enable_side_mirroring = True  # Mirror visible side to occluded side
+
+# Disable occlusion handling
+processor.occlusion_handling_enabled = False
+
+# Disable just side mirroring (keep other occlusion handling)
+processor._enable_side_mirroring = False
+
+Occlusion handling includes:
+- SIDE MIRRORING: Mirrors the visible side's movements to the occluded side
+  (Perfect for side-view videos where half the body is not visible)
+- Temporal confidence tracking (detects consistently low confidence keypoints)
+- Kinematic estimation (uses body structure to predict occluded points)
+- Spatial interpolation (uses neighboring keypoints)
+- Velocity consistency checks (detects unrealistic jumps)
+
+When enabled, it works seamlessly with existing spatio-temporal smoothing.
 """
 
 
@@ -20,6 +45,13 @@ def analyze_video_with_orientation(video_path="data/bench/bench.mp4", exercise_m
     # Create processor and set exercise mode
     processor = PoseProcessor(movenet, input_size)
     processor.feedback.set_exercise_mode(exercise_mode)
+    
+    # OCCLUSION HANDLING TOGGLE (uncomment to disable)
+    # processor.occlusion_handling_enabled = False
+    # processor._enable_side_mirroring = False  # Disable only side mirroring
+    print(f"Occlusion handling: {'ENABLED' if processor.occlusion_handling_enabled else 'DISABLED'}")
+    print(f"Side mirroring: {'ENABLED' if processor._enable_side_mirroring else 'DISABLED'}")
+
 
     # Attach deadlift analyzer if needed
     if exercise_mode == "deadlift":
@@ -45,6 +77,14 @@ def analyze_video_with_orientation(video_path="data/bench/bench.mp4", exercise_m
     metadata_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     metadata_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
+    # Try to get rotation metadata
+    rotation_metadata = 0
+    try:
+        rotation_metadata = int(cap.get(cv2.CAP_PROP_ORIENTATION_META))
+        print(f"Rotation metadata: {rotation_metadata} degrees")
+    except Exception as e:
+        print(f"Could not read rotation metadata: {e}")
+    
     # Read first frame to check orientation
     ret, test_frame = cap.read()
     if not ret:
@@ -58,19 +98,32 @@ def analyze_video_with_orientation(video_path="data/bench/bench.mp4", exercise_m
     # Detect if this is a portrait video that was rotated by OpenCV
     needs_counter_rotation = False
     original_is_portrait = False
+    rotation_angle = 0
     
-    if (metadata_width == 1920 and metadata_height == 1080 and 
-        actual_width == 1920 and actual_height == 1080):
-        print("DETECTED: Portrait video rotated to landscape by OpenCV")
+    # Check rotation metadata (90 or 270 degrees means portrait video stored as landscape)
+    if rotation_metadata in [90, 270]:
+        print(f"DETECTED: Video has {rotation_metadata}° rotation metadata")
         needs_counter_rotation = True
         original_is_portrait = True
-        display_width, display_height = 1080, 1920
+        rotation_angle = rotation_metadata
+        # Swap dimensions for portrait
+        display_width, display_height = actual_height, actual_width
+    # Also check if metadata indicates portrait but actual frame is landscape (OpenCV rotated it)
+    elif metadata_height > metadata_width and actual_width > actual_height:
+        print("DETECTED: Portrait video rotated to landscape by OpenCV (dimension mismatch)")
+        needs_counter_rotation = True
+        original_is_portrait = True
+        rotation_angle = 90  # Assume 90 degree rotation
+        display_width, display_height = metadata_width, metadata_height
     else:
         display_width, display_height = actual_width, actual_height
         original_is_portrait = actual_height > actual_width
     
+    # Store original dimensions for output video (preserve quality)
+    output_width, output_height = display_width, display_height
+    
     print(f"Video orientation: {'Portrait' if original_is_portrait else 'Landscape'}")
-    print(f"Display dimensions: {display_width}x{display_height}")
+    print(f"Original dimensions: {output_width}x{output_height}")
     print(f"Counter-rotation needed: {needs_counter_rotation}")
     
     print("DEBUG: About to configure bench/deadlift analyzer...")
@@ -95,11 +148,12 @@ def analyze_video_with_orientation(video_path="data/bench/bench.mp4", exercise_m
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     # Set up output video writer if output_path is provided
+    # Use original dimensions to preserve quality
     out = None
     if output_path:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (display_width, display_height))
-        print(f"Output video will be saved to: {output_path}")
+        out = cv2.VideoWriter(output_path, fourcc, fps, (output_width, output_height))
+        print(f"Output video will be saved to: {output_path} at {output_width}x{output_height}")
     
     print(f"Processing video in {exercise_mode.upper()} mode...")
     print("Press 'q' to quit, 's' for squat mode, 'b' for bench mode, 'd' for deadlift mode, 'p' to pause")
@@ -123,10 +177,17 @@ def analyze_video_with_orientation(video_path="data/bench/bench.mp4", exercise_m
             if not paused:
                 # Apply counter-rotation if needed to restore original orientation
                 if needs_counter_rotation:
-                    # Counter-rotate from landscape back to portrait (rotate 90 degrees clockwise)
-                    pose_detection_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                    # Counter-rotate based on detected rotation angle
+                    if rotation_angle == 90:
+                        # Video rotated 90° CCW, so rotate 90° CW to restore
+                        pose_detection_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                    elif rotation_angle == 270:
+                        # Video rotated 90° CW, so rotate 90° CCW to restore
+                        pose_detection_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    else:
+                        pose_detection_frame = frame
                     if frame_count <= 3:
-                        print(f"Applied counter-rotation to frame {frame_count}")
+                        print(f"Applied {rotation_angle}° counter-rotation to frame {frame_count}")
                 else:
                     pose_detection_frame = frame
                 
@@ -154,31 +215,43 @@ def analyze_video_with_orientation(video_path="data/bench/bench.mp4", exercise_m
                 # cv2.putText(output_overlay, mode_text, (mode_x, mode_y), 
                 #            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), 2)
                 
-                # Save to output video if enabled
+                # Save to output video if enabled (at original resolution)
                 if out:
-                    # Ensure output frame matches the expected dimensions
-                    if output_overlay.shape[:2] != (display_height, display_width):
-                        output_overlay = cv2.resize(output_overlay, (display_width, display_height))
-                    out.write(output_overlay)
+                    # Ensure output frame matches the original dimensions
+                    if output_overlay.shape[:2] != (output_height, output_width):
+                        output_overlay_saved = cv2.resize(output_overlay, (output_width, output_height))
+                    else:
+                        output_overlay_saved = output_overlay
+                    out.write(output_overlay_saved)
             
-            # Display frame with proper window sizing
+            # Display frame with proper window sizing (scaled for UI)
             window_name = 'Exercise Analysis'
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             
-            # Set appropriate display size based on orientation
+            # Get the frame to display
+            display_frame = output_overlay if not paused else frame
+            
+            # Resize frame to maintain aspect ratio for display window
+            # This is separate from output video dimensions
+            frame_height, frame_width = display_frame.shape[:2]
+            
             if original_is_portrait:
-                # Portrait video - make display window smaller but maintain aspect ratio
-                display_scale = min(800 / display_width, 1200 / display_height)
-                window_width = int(display_width * display_scale)
-                window_height = int(display_height * display_scale)
+                # Portrait video - larger display for better visibility
+                max_width, max_height = 1080, 1920
             else:
                 # Landscape video - standard sizing
-                display_scale = min(1200 / display_width, 800 / display_height)
-                window_width = int(display_width * display_scale)
-                window_height = int(display_height * display_scale)
+                max_width, max_height = 1200, 800
             
-            cv2.resizeWindow(window_name, window_width, window_height)
-            cv2.imshow(window_name, output_overlay if not paused else (pose_detection_frame if not paused else frame))
+            # Calculate scaling factor to fit within max dimensions for UI display
+            scale = min(max_width / frame_width, max_height / frame_height)
+            window_width = int(frame_width * scale)
+            window_height = int(frame_height * scale)
+            
+            # Resize the display frame to exact window dimensions to avoid white space
+            display_frame_resized = cv2.resize(display_frame, (window_width, window_height))
+            
+            # Use WINDOW_AUTOSIZE to prevent manual resizing and white space
+            cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+            cv2.imshow(window_name, display_frame_resized)
             
             # Handle key presses
             key = cv2.waitKey(30) & 0xFF
@@ -224,26 +297,9 @@ def get_user_choices():
     """Get user choices for exercise type, video, and output saving."""
     import os
     
-    # Choose exercise mode
-
-    print("\n=== Exercise Selection ===")
-    print("1. Squat")
-    print("2. Bench Press")
-    print("3. Deadlift")
-
-    while True:
-        choice = input("Choose exercise (1, 2, or 3): ").strip()
-        if choice == "1":
-            exercise_mode = "squat"
-            break
-        elif choice == "2":
-            exercise_mode = "bench"
-            break
-        elif choice == "3":
-            exercise_mode = "deadlift"
-            break
-        else:
-            print("Invalid choice. Please enter 1, 2, or 3.")
+    # Automatically set to squat mode
+    exercise_mode = "squat"
+    print("\n=== Squat Mode (Auto-selected) ===")
     
     # Choose video based on exercise mode
     print(f"\n=== {exercise_mode.capitalize()} Video Selection ===")

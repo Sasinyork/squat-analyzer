@@ -594,6 +594,37 @@ class DeadliftFormAnalyzer:
 
         self._last_phase = phase
 
+        # Add positive feedback if no issues detected
+        if not recommendations_detailed:
+            if phase == "standing":
+                recommendations.append("Good form!")
+                recommendations_detailed.append({
+                    'text': "Good form!",
+                    'type': 'positive_feedback',
+                    'severity': 'good'
+                })
+            elif phase == "descending":
+                recommendations.append("Controlled descent!")
+                recommendations_detailed.append({
+                    'text': "Controlled descent!",
+                    'type': 'positive_feedback',
+                    'severity': 'good'
+                })
+            elif phase == "bottom":
+                recommendations.append("Good position!")
+                recommendations_detailed.append({
+                    'text': "Good position!",
+                    'type': 'positive_feedback',
+                    'severity': 'good'
+                })
+            elif phase == "ascending":
+                recommendations.append("Drive up strong!")
+                recommendations_detailed.append({
+                    'text': "Drive up strong!",
+                    'type': 'positive_feedback',
+                    'severity': 'good'
+                })
+
         return {
             "phase": phase,
             "hip_extension_norm": hip_ext_norm,

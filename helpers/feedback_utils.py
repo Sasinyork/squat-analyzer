@@ -4,6 +4,28 @@ from PIL import Image, ImageDraw
 from helpers.analyzers.squat_analyzer import SquatFormAnalyzer
 from helpers.analyzers.bench_analyzer import BenchPressFormAnalyzer
 
+
+def calculate_ui_scale(height, width):
+    """Calculate scale factor for UI elements based on video resolution.
+    
+    Uses 1080x1920 (portrait) as the baseline reference resolution.
+    Returns a scale factor for text sizes, padding, margins, etc.
+    """
+    # Reference resolution (1080 width x 1920 height for portrait videos)
+    reference_width = 1080
+    reference_height = 1920
+    
+    # Calculate scale based on the smaller dimension
+    if height > width:
+        # Portrait orientation
+        scale = width / reference_width
+    else:
+        # Landscape orientation - use height as reference
+        scale = height / reference_height
+    
+    return max(0.5, min(scale, 3.0))  # Clamp between 0.5x and 3x
+
+
 class PoseFeedback:
     """Handles real-time feedback for pose detection positioning and exercise form."""
     
@@ -281,9 +303,11 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     """Draw comprehensive feedback on the image with mobile-optimized layout."""
     height, width, _ = image.shape
     
+    # Calculate UI scale factor based on video resolution
+    ui_scale = calculate_ui_scale(height, width)
 
     # Calculate adaptive background height based on content - increased for larger text
-    base_height = 100  # Base height accommodates title area
+    base_height = int(100 * ui_scale)  # Base height accommodates title area
     extra_height = 0
 
     # Add extra height for phase pill if form_analysis has a phase (all modes)
@@ -314,7 +338,7 @@ def draw_comprehensive_feedback_overlay(image, feedback):
             phase_bg_color = common_palette.get(current_phase, (180, 180, 180))
             # Choose readable text color based on brightness
             phase_text_color = (0, 0, 0) if sum(phase_bg_color) > 500 else (255, 255, 255)
-            extra_height += 28
+            extra_height += int(28 * ui_scale)
         # Rep counters (if present in form analysis for squat/deadlift)
         if any(k in fa for k in ['rep_count', 'correct_rep_count', 'incorrect_rep_count']):
             show_reps = True
@@ -328,31 +352,31 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         # Deadlift: show hip extension cue if present
         if feedback.get('exercise_mode') == 'deadlift' and form_analysis.get('hip_extension_message'):
             status_lines += 1
-            extra_height += 24 + 10
+            extra_height += int((24 + 10) * ui_scale)
         else:
             if form_analysis.get('back_message') and form_analysis.get('back_status') is not None:
                 status_lines += 1
             if form_analysis.get('depth_message') and form_analysis.get('depth_status') is not None:
                 status_lines += 1
             if status_lines > 1:
-                extra_height += (status_lines - 1) * 26
+                extra_height += int((status_lines - 1) * 26 * ui_scale)
             if form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0:
                 recommendation_text = form_analysis['recommendations'][0]
                 max_chars_per_line = 65
                 if len(recommendation_text) > max_chars_per_line:
                     estimated_lines = max(1, len(recommendation_text) // max_chars_per_line + 1)
-                    extra_height += (estimated_lines * 24) + 10
+                    extra_height += int((estimated_lines * 24 + 10) * ui_scale)
                 else:
-                    extra_height += 24 + 10
+                    extra_height += int((24 + 10) * ui_scale)
             if status_lines > 0 or (form_analysis.get('recommendations') and len(form_analysis['recommendations']) > 0):
                 pill_font = cv2.FONT_HERSHEY_SIMPLEX
-                pill_scale = 0.9
-                pill_thickness = 2
+                pill_scale = 0.9 * ui_scale
+                pill_thickness = max(1, int(2 * ui_scale))
                 label = 'CORRECT FORM' if (form_analysis.get('depth_status') == 'good' and form_analysis.get('back_status') == 'good') else 'INCORRECT FORM'
                 text_size = cv2.getTextSize(label, pill_font, pill_scale, pill_thickness)[0]
-                vertical_padding = 8
+                vertical_padding = int(8 * ui_scale)
                 pill_height = text_size[1] + vertical_padding * 2
-                extra_height += pill_height + 16
+                extra_height += int((pill_height + 16) * ui_scale)
 
     # Bench mode: allocate extra space for form feedback issues
     if feedback.get('exercise_mode') == 'bench' and feedback.get('form_analysis'):
@@ -366,18 +390,18 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                 recommendation = issue.get('recommendation', '')
                 full_text = f"{message} - {recommendation}" if recommendation else message
                 estimated_lines = max(1, len(full_text) // max_chars_per_line + 1)
-                extra_height += (estimated_lines * 26) + 8  # 26px per line + 8px spacing
+                extra_height += int((estimated_lines * 26 + 8) * ui_scale)  # 26px per line + 8px spacing
         else:
             # "Form looks good!" message
-            extra_height += 30
+            extra_height += int(30 * ui_scale)
     
     text_bg_height = base_height + extra_height
     
     # Ensure we don't exceed image bounds and leave some margin
-    max_height = min(height * 0.35, 220)  # Increased max height for bench press (was 0.3, 180)
+    max_height = min(height * 0.35, int(220 * ui_scale))  # Increased max height for bench press (was 0.3, 180)
     # For deadlift, keep a fixed overlay height to prevent jitter when messages appear/disappear
     if feedback.get('exercise_mode') == 'deadlift':
-        text_bg_height = min(int(160), int(max_height))
+        text_bg_height = min(int(160 * ui_scale), int(max_height))
     elif feedback.get('exercise_mode') == 'bench':
         # For bench, allow more height for form feedback
         text_bg_height = min(int(text_bg_height), int(max_height))
@@ -385,9 +409,9 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         text_bg_height = int(max_height)
     
     # Position overlay with margin from bottom and sides
-    margin = 5  # Base bottom margin
+    margin = int(5 * ui_scale)  # Base bottom margin
     side_margin = 0
-    bottom_offset = min(int(height * 0.06), 64)
+    bottom_offset = min(int(height * 0.06), int(64 * ui_scale))
     bg_y_start = max(0, height - text_bg_height - margin - bottom_offset)
 
     # Ensure valid rectangle coordinates
@@ -397,12 +421,12 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     y2 = min(height - margin - bottom_offset + (height - (bg_y_start + text_bg_height + margin)), height - margin)
 
     # Draw rep counter as a full-width top bar with three columns (Total Reps, Correct, Incorrect) only if rep counting is active
-    # For squat mode, get rep counts from form_analysis if present
+    # Get rep counts from form_analysis for all exercise modes
     rep_count = 0
     correct_count = 0
     incorrect_count = 0
-    # Show rep counter for squat and deadlift modes
-    if feedback.get('exercise_mode') in ['squat', 'deadlift'] and feedback.get('form_analysis'):
+    # Show rep counter for squat, deadlift, and bench modes
+    if feedback.get('exercise_mode') in ['squat', 'deadlift', 'bench'] and feedback.get('form_analysis'):
         fa = feedback['form_analysis']
         rep_count = fa.get('rep_count', 0)
         correct_count = fa.get('correct_rep_count', 0)
@@ -411,13 +435,13 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         rep_count = feedback.get('rep_count', 0)
         correct_count = feedback.get('correct_rep_count', 0)
         incorrect_count = feedback.get('incorrect_rep_count', 0)
-    # Always show rep counter for deadlift and squat modes
+    # Always show rep counter for all three exercise modes
     rep_counter_active = feedback.get('exercise_mode') in ['squat', 'deadlift', 'bench']
     if rep_counter_active:
         # Bar background color (dark blue-ish)
         bar_color = (80, 86, 106)
         bar_alpha = 0.95
-        bar_height = 120
+        bar_height = int(120 * ui_scale)
         bar_y1 = 0
         bar_y2 = bar_y1 + bar_height
         # Draw the full-width bar
@@ -436,17 +460,17 @@ def draw_comprehensive_feedback_overlay(image, feedback):
         label_colors = [reps_label_color, correct_color, incorrect_color]
 
         # Draw divider lines between columns
-        divider_thickness = 4
+        divider_thickness = max(1, int(4 * ui_scale))
         for i in [1, 2]:
             x = col_x[i]
-            cv2.line(image, (x, bar_y1 + 12), (x, bar_y2 - 12), (120, 120, 120), divider_thickness)
+            cv2.line(image, (x, int(bar_y1 + 12 * ui_scale)), (x, int(bar_y2 - 12 * ui_scale)), (120, 120, 120), divider_thickness)
 
         # Draw each column: label (top, centered), value (below, centered)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        label_font_scale = 0.9
-        label_thickness = 4
-        value_font_scale = 1.2
-        value_thickness = 6
+        label_font_scale = 0.9 * ui_scale
+        label_thickness = max(1, int(4 * ui_scale))
+        value_font_scale = 1.2 * ui_scale
+        value_thickness = max(1, int(6 * ui_scale))
         for i in range(3):
             # Center of this column
             center_x = (col_x[i] + col_x[i+1]) // 2
@@ -457,26 +481,26 @@ def draw_comprehensive_feedback_overlay(image, feedback):
             for j, line in enumerate(label_lines):
                 label_size = cv2.getTextSize(line, font, label_font_scale, label_thickness)[0]
                 label_x = center_x - label_size[0] // 2
-                label_y = bar_y1 + 42 + j * (label_size[1] + 2)
+                label_y = int(bar_y1 + 42 * ui_scale + j * (label_size[1] + 2))
                 cv2.putText(image, line, (label_x, label_y), font, label_font_scale, label_colors[i], label_thickness, cv2.LINE_AA)
             # Draw value (below label, centered)
             value_str = str(values[i])
             value_size = cv2.getTextSize(value_str, font, value_font_scale, value_thickness)[0]
             value_x = center_x - value_size[0] // 2
-            value_y = bar_y1 + 78 + value_size[1] // 2
+            value_y = int(bar_y1 + 78 * ui_scale + value_size[1] // 2)
             cv2.putText(image, value_str, (value_x, value_y), font, value_font_scale, (255, 255, 255), value_thickness, cv2.LINE_AA)
     
     # Only draw if we have a valid rectangle
     if x1 < x2 and y1 < y2:
         # Draw rounded rectangle background with alpha transparency
-        image = draw_rounded_rectangle_with_alpha(image, x1, y1, x2, y2, (80, 86, 106), alpha=0.7, radius=10)
+        image = draw_rounded_rectangle_with_alpha(image, x1, y1, x2, y2, (80, 86, 106), alpha=0.7, radius=int(10 * ui_scale))
         
 
         # Draw rep counter if enabled (at the top of overlay)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.95
-        thickness = 2
-        y_offset = 20
+        font_scale = 0.95 * ui_scale
+        thickness = max(1, int(2 * ui_scale))
+        y_offset = int(20 * ui_scale)
         # Draw phase only as a feedback line with background (handled below)
         # Remove duplicate phase display here
 
@@ -485,19 +509,19 @@ def draw_comprehensive_feedback_overlay(image, feedback):
     # Only draw if we have a valid rectangle
     if x1 < x2 and y1 < y2:
         # Draw rounded rectangle background with alpha transparency
-        image = draw_rounded_rectangle_with_alpha(image, x1, y1, x2, y2, (80, 86, 106), alpha=0.7, radius=10)
+        image = draw_rounded_rectangle_with_alpha(image, x1, y1, x2, y2, (80, 86, 106), alpha=0.7, radius=int(10 * ui_scale))
 
         # Prepare all feedback lines to display
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale_main = 1.1  # Increased font size for main message
-        font_scale_secondary = 1.1  # For secondary lines
-        font_scale_small = 0.95
-        thickness_main = 2
-        thickness_secondary = 2
-        thickness_small = 2
-    y_offset = 36
-    line_spacing = 18
-    block_spacing = 34  # Increased gap between feedback lines
+        font_scale_main = 1.1 * ui_scale  # Increased font size for main message
+        font_scale_secondary = 1.1 * ui_scale  # For secondary lines
+        font_scale_small = 0.95 * ui_scale
+        thickness_main = max(1, int(2 * ui_scale))
+        thickness_secondary = max(1, int(2 * ui_scale))
+        thickness_small = max(1, int(2 * ui_scale))
+    y_offset = int(36 * ui_scale)
+    line_spacing = int(18 * ui_scale)
+    block_spacing = int(34 * ui_scale)  # Increased gap between feedback lines
     lines = []
     bg_colors = []
     text_colors = []
@@ -599,10 +623,27 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                     lines.append(wline)
                     bg_colors.append((40,40,40))
                     text_colors.append(depth_color)
+            
+            # If no back or depth messages shown, display positive recommendations if available
+            if not form_analysis.get('back_message') and not form_analysis.get('depth_message'):
+                recs = form_analysis.get('recommendations', [])
+                for rec in recs:
+                    # Check if it's a positive recommendation
+                    if any(word in rec.lower() for word in ['good', 'great', 'strong', 'controlled', 'ready']):
+                        rec_color = (90, 170, 90)  # muted green for positive feedback
+                    else:
+                        rec_color = (60, 160, 255)  # amber for improvement
+                    wrapped = wrap_text(rec, font, font_scale_secondary, thickness_secondary, max_text_width)
+                    for wline in wrapped:
+                        lines.append(wline)
+                        bg_colors.append((40,40,40))
+                        text_colors.append(rec_color)
         elif feedback.get('exercise_mode') == 'deadlift':
             # Helper: map severity string to BGR color
             def _severity_to_color(sev):
-                # low -> soft yellow, medium -> soft amber, high -> muted red
+                # good -> muted green, low -> soft yellow, medium -> soft amber, high -> muted red
+                if sev == 'good':
+                    return (90, 170, 90)  # muted green for positive feedback
                 if sev == 'low':
                     return (60, 220, 255)
                 if sev == 'medium':
@@ -682,9 +723,20 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                     bg_colors.append((40,40,40))
                     text_colors.append(issue_color)
             
-            # If no issues, show a positive feedback message
+            # If no issues, show a positive feedback message based on phase
             if not issues_list:
-                lines.append("Form looks good!")
+                phase = form_analysis.get('phase', '').lower()
+                if phase == 'rest':
+                    positive_msg = "Form looks good!"
+                elif phase == 'lowering':
+                    positive_msg = "Controlled descent!"
+                elif phase == 'pause':
+                    positive_msg = "Good pause at chest!"
+                elif phase == 'pressing':
+                    positive_msg = "Strong press!"
+                else:
+                    positive_msg = "Form looks good!"
+                lines.append(positive_msg)
                 bg_colors.append((40,40,40))
                 text_colors.append((90, 170, 90))  # muted green
         else:
@@ -713,14 +765,14 @@ def draw_comprehensive_feedback_overlay(image, feedback):
             scale = font_scale_secondary
             thick = thickness_secondary
         text_size = cv2.getTextSize(text, font, scale, thick)[0]
-        pad_x = 32
-        pad_y = 16  # Slightly more vertical padding
-        rect_x1 = x1 + 16
-        rect_x2 = x2 - 16
+        pad_x = int(32 * ui_scale)
+        pad_y = int(16 * ui_scale)  # Slightly more vertical padding
+        rect_x1 = int(x1 + 16 * ui_scale)
+        rect_x2 = int(x2 - 16 * ui_scale)
         rect_y1 = current_y - text_size[1] - pad_y//2
-        rect_y2 = current_y + pad_y + 4
+        rect_y2 = int(current_y + pad_y + 4 * ui_scale)
         # Draw background for this line
-        image = draw_rounded_rectangle_with_alpha(image, rect_x1, rect_y1, rect_x2, rect_y2, bg_color, alpha=0.85, radius=12)
+        image = draw_rounded_rectangle_with_alpha(image, rect_x1, rect_y1, rect_x2, rect_y2, bg_color, alpha=0.85, radius=int(12 * ui_scale))
         # Draw text centered
         text_x = (rect_x1 + rect_x2 - text_size[0]) // 2
         text_y = current_y + pad_y//2

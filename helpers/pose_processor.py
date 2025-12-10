@@ -32,6 +32,7 @@ class PoseProcessor:
         # Smoothing options
         self.spatiotemporal_enabled = True  # Spatio temporal smoothing toggle
         self.kalman_enabled = False  # Kalman filter smoothing toggle
+        self.occlusion_handling_enabled = False  # Toggle for occlusion handling
 
         # Pure spatio-temporal smoothing controls
         self.temporal_alpha = 0.35    # Increased weight to previous for more stability
@@ -49,6 +50,22 @@ class PoseProcessor:
         self.lead_gain = 0.0          # disable lookahead (causes overshoot with noisy data)
         self.last_frame_shape = None
         
+        # Occlusion handling state
+        self._occlusion_state = np.zeros(17, dtype=int)  # 0=visible, >0=frames occluded
+        self._occlusion_threshold = 3  # Frames to confirm occlusion
+        self._occlusion_conf_threshold = 0.20  # Confidence below this suggests occlusion
+        self._occlusion_history_len = 5  # Frames to track for temporal consistency
+        self._confidence_history = []  # Track confidence over time
+        self._velocity_history = []  # Track velocity for consistency
+        self._velocity_hist_len = 3  # Frames to track velocity
+        self._max_velocity_jump = 0.15  # Max normalized velocity change per frame
+        
+        # Side mirroring for occlusion (for side-view videos)
+        self._enable_side_mirroring = True  # Mirror visible side to occluded side
+        self._side_mirror_conf_diff = 0.10  # Min confidence difference to trigger mirroring (lowered for more sensitivity)
+        self._mirror_blend_alpha = 0.3  # Smooth transition for mirroring (lower = smoother)
+        self._prev_mirrored = {}  # Store previous mirrored positions for smooth transition
+        
         # One Euro Filter parameters for adaptive smoothing
         self._one_euro_enabled = True
         self._one_euro_filters = None  # Will store filter state per keypoint
@@ -56,12 +73,23 @@ class PoseProcessor:
         self._one_euro_beta = 0.007  # Speed coefficient - lower = less responsive to speed
         self._one_euro_dcutoff = 1.0  # Derivative cutoff frequency
 
-        # Movement consistency tracking
-        self._velocity_history = []  # Track velocity for consistency
-        self._velocity_hist_len = 3
-
         # Kalman filter state for each keypoint (17 keypoints, 2D)
         self._kalman_filters = None  # Will be initialized on first use
+        
+    def _build_neighbors(self):
+        """Build adjacency list from KEYPOINT_EDGES for spatial smoothing."""
+        edges = [
+            (0, 1), (0, 2), (1, 3), (2, 4), (0, 5), (0, 6),
+            (5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11),
+            (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)
+        ]
+        neighbors = {}
+        for i in range(17):
+            neighbors[i] = []
+        for a, b in edges:
+            neighbors[a].append(b)
+            neighbors[b].append(a)
+        return neighbors
 
     def _init_kalman_filters(self, initial_kps):
         # Each keypoint gets its own Kalman filter (x and y)
@@ -173,32 +201,36 @@ class PoseProcessor:
                 self._init_kalman_filters(kps)
             # ...existing Kalman smoothing and clamping logic...
             arm_indices = [7, 8, 9, 10]
-            # Only clamp wrist y below elbow for squat, not deadlift
+            # Only clamp wrist y below elbow for bench/deadlift, NOT for squat
+            # In squat, arms are typically UP holding the barbell
             mode = getattr(self.feedback, 'exercise_mode', 'squat')
-            if mode == 'squat':
+            if mode != 'squat':  # Changed condition - only apply for non-squat exercises
                 left_elbow_y = kps[7, 0]
                 right_elbow_y = kps[8, 0]
                 if kps[9, 0] > left_elbow_y:
                     kps[9, 0] = left_elbow_y
                 if kps[10, 0] > right_elbow_y:
                     kps[10, 0] = right_elbow_y
-            # Clamp wrist x so it cannot cross to the opposite side of the elbow (relative to previous forearm direction)
-            prev_left_elbow_x = self._kalman_filters[7]['y']
-            prev_left_wrist_x = self._kalman_filters[9]['y']
-            curr_left_elbow_x = kps[7, 1]
-            curr_left_wrist_x = kps[9, 1]
-            prev_left_dir = np.sign(prev_left_wrist_x - prev_left_elbow_x)
-            curr_left_dir = np.sign(curr_left_wrist_x - curr_left_elbow_x)
-            if prev_left_dir != 0 and curr_left_dir != 0 and prev_left_dir != curr_left_dir:
-                kps[9, 1] = curr_left_elbow_x
-            prev_right_elbow_x = self._kalman_filters[8]['y']
-            prev_right_wrist_x = self._kalman_filters[10]['y']
-            curr_right_elbow_x = kps[8, 1]
-            curr_right_wrist_x = kps[10, 1]
-            prev_right_dir = np.sign(prev_right_wrist_x - prev_right_elbow_x)
-            curr_right_dir = np.sign(curr_right_wrist_x - curr_right_elbow_x)
-            if prev_right_dir != 0 and curr_right_dir != 0 and prev_right_dir != curr_right_dir:
-                kps[10, 1] = curr_right_elbow_x
+            
+            # Disable wrist crossing prevention for squat (arms can move freely)
+            if mode != 'squat':
+                # Clamp wrist x so it cannot cross to the opposite side of the elbow (relative to previous forearm direction)
+                prev_left_elbow_x = self._kalman_filters[7]['y']
+                prev_left_wrist_x = self._kalman_filters[9]['y']
+                curr_left_elbow_x = kps[7, 1]
+                curr_left_wrist_x = kps[9, 1]
+                prev_left_dir = np.sign(prev_left_wrist_x - prev_left_elbow_x)
+                curr_left_dir = np.sign(curr_left_wrist_x - curr_left_elbow_x)
+                if prev_left_dir != 0 and curr_left_dir != 0 and prev_left_dir != curr_left_dir:
+                    kps[9, 1] = curr_left_elbow_x
+                prev_right_elbow_x = self._kalman_filters[8]['y']
+                prev_right_wrist_x = self._kalman_filters[10]['y']
+                curr_right_elbow_x = kps[8, 1]
+                curr_right_wrist_x = kps[10, 1]
+                prev_right_dir = np.sign(prev_right_wrist_x - prev_right_elbow_x)
+                curr_right_dir = np.sign(curr_right_wrist_x - curr_right_elbow_x)
+                if prev_right_dir != 0 and curr_right_dir != 0 and prev_right_dir != curr_right_dir:
+                    kps[10, 1] = curr_right_elbow_x
             # ...existing Kalman update loop...
             shoulder_indices = [5, 6]
             hips = kps[[11, 12], 1]
@@ -223,18 +255,21 @@ class PoseProcessor:
                 x, y = kps[i, 0], kps[i, 1]
                 c = conf[i]
                 predict_arm = False
-                left_elbow_dist = np.linalg.norm(kps[7, :2] - kps[13, :2])
-                left_wrist_dist = np.linalg.norm(kps[9, :2] - kps[13, :2])
-                if (left_elbow_dist < freeze_thresh or left_wrist_dist < freeze_thresh):
-                    if conf[7] < 0.25 or conf[9] < 0.25 or conf[13] < 0.25:
-                        if i in [7, 9]:
-                            predict_arm = True
-                right_elbow_dist = np.linalg.norm(kps[8, :2] - kps[14, :2])
-                right_wrist_dist = np.linalg.norm(kps[10, :2] - kps[14, :2])
-                if (right_elbow_dist < freeze_thresh or right_wrist_dist < freeze_thresh):
-                    if conf[8] < 0.25 or conf[10] < 0.25 or conf[14] < 0.25:
-                        if i in [8, 10]:
-                            predict_arm = True
+                
+                # Disable arm-leg collision detection for squat (arms are up, not near legs)
+                if mode != 'squat':
+                    left_elbow_dist = np.linalg.norm(kps[7, :2] - kps[13, :2])
+                    left_wrist_dist = np.linalg.norm(kps[9, :2] - kps[13, :2])
+                    if (left_elbow_dist < freeze_thresh or left_wrist_dist < freeze_thresh):
+                        if conf[7] < 0.25 or conf[9] < 0.25 or conf[13] < 0.25:
+                            if i in [7, 9]:
+                                predict_arm = True
+                    right_elbow_dist = np.linalg.norm(kps[8, :2] - kps[14, :2])
+                    right_wrist_dist = np.linalg.norm(kps[10, :2] - kps[14, :2])
+                    if (right_elbow_dist < freeze_thresh or right_wrist_dist < freeze_thresh):
+                        if conf[8] < 0.25 or conf[10] < 0.25 or conf[14] < 0.25:
+                            if i in [8, 10]:
+                                predict_arm = True
                 if predict_arm:
                     if i in [7, 9]:
                         sh_idx = 5
@@ -253,7 +288,9 @@ class PoseProcessor:
                     kps[i, 0] = xk
                     kps[i, 1] = yk
                     continue
-                if i in arm_indices:
+                    
+                # Old arm mirroring logic - skip for squat, let new occlusion handling take over
+                if i in arm_indices and mode != 'squat':
                     if (left_arm_conf > right_arm_conf + 0.10) and (right_arm_conf < mirror_threshold) and (i in [8, 10]):
                         sh_x = self._kalman_filters[6]['x']
                         sh_y = self._kalman_filters[6]['y']
@@ -439,6 +476,376 @@ class PoseProcessor:
         """Deprecated: movement-based smoothing removed."""
         return np.zeros(current_kp.shape[0])
     
+    # ========== OCCLUSION HANDLING METHODS ==========
+    
+    def _update_occlusion_state(self, conf):
+        """Track which keypoints are likely occluded over time.
+        
+        Args:
+            conf: (17,) array of confidence scores
+            
+        Updates self._occlusion_state with frame counts since occlusion started
+        """
+        for i in range(17):
+            if conf[i] < self._occlusion_conf_threshold:
+                # Low confidence - increment occlusion counter
+                self._occlusion_state[i] += 1
+            else:
+                # Good confidence - reset counter
+                self._occlusion_state[i] = 0
+    
+    def _is_occluded(self, kp_idx):
+        """Check if a keypoint is currently considered occluded.
+        
+        Args:
+            kp_idx: Keypoint index
+            
+        Returns:
+            bool: True if keypoint is occluded
+        """
+        return self._occlusion_state[kp_idx] >= self._occlusion_threshold
+    
+    def _update_confidence_history(self, conf):
+        """Track confidence over time for temporal consistency analysis.
+        
+        Args:
+            conf: (17,) array of confidence scores
+        """
+        self._confidence_history.append(conf.copy())
+        if len(self._confidence_history) > self._occlusion_history_len:
+            self._confidence_history.pop(0)
+    
+    def _check_temporal_confidence_consistency(self, kp_idx):
+        """Check if a keypoint has consistently low confidence (likely occluded).
+        
+        Args:
+            kp_idx: Keypoint index
+            
+        Returns:
+            bool: True if confidence is consistently low
+        """
+        if len(self._confidence_history) < 3:
+            return False
+        
+        recent_conf = [hist[kp_idx] for hist in self._confidence_history[-3:]]
+        return np.mean(recent_conf) < self._occlusion_conf_threshold
+    
+    def _mirror_visible_side_to_occluded(self, yx, conf):
+        """Mirror the visible side of the body to the occluded side.
+        
+        For side-view videos, this copies the movement pattern from the visible side
+        to the occluded side, maintaining the relative position structure.
+        
+        Args:
+            yx: (17,2) array of current keypoint positions
+            conf: (17,) array of confidence scores
+            
+        Returns:
+            (17,2) array of corrected keypoint positions
+        """
+        if not self._enable_side_mirroring:
+            return yx
+        
+        yx_corrected = yx.copy()
+        
+        # Define left-right keypoint pairs with their parent keypoints for proper mirroring
+        # Format: (left_idx, right_idx, left_parent, right_parent)
+        keypoint_pairs = [
+            # Arms - mirror relative to respective shoulders
+            (7, 8, 5, 6),   # left_elbow, right_elbow, anchored to shoulders
+            (9, 10, 7, 8),  # left_wrist, right_wrist, anchored to elbows
+            
+            # Legs - mirror relative to respective hips  
+            (13, 14, 11, 12), # left_knee, right_knee, anchored to hips
+            (15, 16, 13, 14), # left_ankle, right_ankle, anchored to knees
+        ]
+        
+        # Process each pair
+        for left_idx, right_idx, left_parent, right_parent in keypoint_pairs:
+            left_conf = conf[left_idx]
+            right_conf = conf[right_idx]
+            
+            # Determine which side is more visible
+            conf_diff = abs(left_conf - right_conf)
+            
+            # Only mirror if confidence difference is significant OR one side is very low
+            should_mirror = (conf_diff > self._side_mirror_conf_diff) or \
+                          (left_conf < self._occlusion_conf_threshold) or \
+                          (right_conf < self._occlusion_conf_threshold)
+            
+            if not should_mirror:
+                continue
+            
+            # Determine source and target
+            if left_conf > right_conf:
+                # Left is visible, mirror to right
+                source_idx = left_idx
+                target_idx = right_idx
+                source_parent = left_parent
+                target_parent = right_parent
+            else:
+                # Right is visible, mirror to left
+                source_idx = right_idx
+                target_idx = left_idx
+                source_parent = right_parent
+                target_parent = left_parent
+            
+            # Check if parents are visible
+            if conf[source_parent] > self._occlusion_conf_threshold and \
+               conf[target_parent] > self._occlusion_conf_threshold:
+                
+                # Calculate the offset from source parent to source keypoint
+                offset_y = yx[source_idx, 0] - yx[source_parent, 0]  # vertical offset
+                offset_x = yx[source_idx, 1] - yx[source_parent, 1]  # horizontal offset
+                
+                # Apply SAME offset to target (not mirrored) - this maintains movement pattern
+                # For side view, both sides move similarly
+                new_pos = np.array([
+                    yx[target_parent, 0] + offset_y,  # Same Y offset
+                    yx[target_parent, 1] + offset_x   # Same X offset (NOT mirrored)
+                ])
+                
+                # Smooth the transition to avoid jitter
+                if target_idx in self._prev_mirrored:
+                    # Blend with previous mirrored position
+                    alpha = self._mirror_blend_alpha
+                    new_pos = alpha * new_pos + (1 - alpha) * self._prev_mirrored[target_idx]
+                
+                # Store for next frame
+                self._prev_mirrored[target_idx] = new_pos.copy()
+                
+                # Apply the mirrored position
+                yx_corrected[target_idx] = new_pos
+        
+        return yx_corrected
+
+    
+    def _estimate_occluded_keypoint_kinematic(self, kp_idx, yx, conf):
+        """Use biomechanical constraints to estimate occluded keypoint position.
+        
+        Uses body structure and limb length constraints to predict position
+        of occluded keypoints based on connected visible keypoints.
+        
+        Args:
+            kp_idx: Index of occluded keypoint
+            yx: (17,2) array of current keypoint positions
+            conf: (17,) array of confidence scores
+            
+        Returns:
+            (y, x) tuple of estimated position, or None if can't estimate
+        """
+        # Define kinematic chains (parent -> child relationships)
+        kinematic_chains = {
+            # Head/neck
+            1: [0],  # left_eye <- nose
+            2: [0],  # right_eye <- nose
+            3: [1],  # left_ear <- left_eye
+            4: [2],  # right_ear <- right_eye
+            
+            # Arms
+            7: [5],  # left_elbow <- left_shoulder
+            9: [7],  # left_wrist <- left_elbow
+            8: [6],  # right_elbow <- right_shoulder
+            10: [8],  # right_wrist <- right_elbow
+            
+            # Torso and legs
+            11: [5],  # left_hip <- left_shoulder
+            12: [6],  # right_hip <- right_shoulder
+            13: [11],  # left_knee <- left_hip
+            15: [13],  # left_ankle <- left_knee
+            14: [12],  # right_knee <- right_hip
+            16: [14],  # right_ankle <- right_knee
+        }
+        
+        # Define typical limb length ratios (relative to torso)
+        limb_length_ratios = {
+            # Arms (relative to shoulder position)
+            7: 0.3,  # shoulder to elbow
+            9: 0.3,  # elbow to wrist
+            8: 0.3,
+            10: 0.3,
+            
+            # Legs (relative to hip position)
+            13: 0.35,  # hip to knee
+            15: 0.35,  # knee to ankle
+            14: 0.35,
+            16: 0.35,
+        }
+        
+        if kp_idx not in kinematic_chains:
+            return None
+        
+        # Find a confident parent keypoint
+        parents = kinematic_chains[kp_idx]
+        for parent_idx in parents:
+            if conf[parent_idx] > self.spatial_min_conf:
+                parent_pos = yx[parent_idx]
+                
+                # If we have history, use previous displacement
+                if self._prev_smoothed is not None:
+                    prev_offset = self._prev_smoothed[kp_idx, :2] - self._prev_smoothed[parent_idx, :2]
+                    estimated_pos = parent_pos + prev_offset
+                    return estimated_pos
+                
+                # Otherwise use typical limb length
+                elif kp_idx in limb_length_ratios:
+                    # Use previous direction if available
+                    if self._prev_smoothed is not None:
+                        direction = self._prev_smoothed[kp_idx, :2] - self._prev_smoothed[parent_idx, :2]
+                        direction_norm = np.linalg.norm(direction)
+                        if direction_norm > 1e-6:
+                            direction = direction / direction_norm
+                            estimated_pos = parent_pos + direction * limb_length_ratios[kp_idx]
+                            return estimated_pos
+        
+        return None
+    
+    def _apply_spatial_interpolation_for_occlusion(self, kp_idx, yx, conf):
+        """Enhanced spatial smoothing specifically for occluded keypoints.
+        
+        More aggressively uses neighbor positions to interpolate occluded points.
+        
+        Args:
+            kp_idx: Index of keypoint to interpolate
+            yx: (17,2) array of current keypoint positions
+            conf: (17,) array of confidence scores
+            
+        Returns:
+            (y, x) tuple of interpolated position, or None if can't interpolate
+        """
+        neighbors = self._neighbors.get(kp_idx, [])
+        if not neighbors:
+            return None
+        
+        # Collect confident neighbor positions
+        neighbor_positions = []
+        neighbor_weights = []
+        
+        for neighbor_idx in neighbors:
+            if conf[neighbor_idx] > self.spatial_min_conf and not self._is_occluded(neighbor_idx):
+                neighbor_positions.append(yx[neighbor_idx])
+                # Weight by confidence
+                neighbor_weights.append(conf[neighbor_idx])
+        
+        if len(neighbor_positions) == 0:
+            return None
+        
+        # Weighted average of neighbor positions
+        neighbor_positions = np.array(neighbor_positions)
+        neighbor_weights = np.array(neighbor_weights)
+        neighbor_weights = neighbor_weights / np.sum(neighbor_weights)  # Normalize
+        
+        interpolated_pos = np.sum(neighbor_positions * neighbor_weights[:, np.newaxis], axis=0)
+        return interpolated_pos
+    
+    def _check_velocity_consistency(self, yx, prev_yx):
+        """Check for unrealistic velocity jumps and flag inconsistent keypoints.
+        
+        Args:
+            yx: (17,2) array of current keypoint positions
+            prev_yx: (17,2) array of previous keypoint positions
+            
+        Returns:
+            (17,) boolean array where True indicates unrealistic velocity
+        """
+        if prev_yx is None:
+            return np.zeros(17, dtype=bool)
+        
+        # Calculate current velocity
+        velocity = yx - prev_yx
+        velocity_magnitude = np.linalg.norm(velocity, axis=1)
+        
+        # Update velocity history
+        self._velocity_history.append(velocity.copy())
+        if len(self._velocity_history) > self._velocity_hist_len:
+            self._velocity_history.pop(0)
+        
+        # Check for unrealistic jumps
+        inconsistent = np.zeros(17, dtype=bool)
+        
+        if len(self._velocity_history) >= 2:
+            # Compare current velocity to recent average
+            recent_velocities = np.array(self._velocity_history[:-1])  # Exclude current
+            avg_velocity = np.mean(recent_velocities, axis=0)
+            avg_velocity_magnitude = np.linalg.norm(avg_velocity, axis=1)
+            
+            # Flag if velocity jump is too large
+            for i in range(17):
+                velocity_change = abs(velocity_magnitude[i] - avg_velocity_magnitude[i])
+                if velocity_change > self._max_velocity_jump:
+                    inconsistent[i] = True
+        
+        return inconsistent
+    
+    def _handle_occluded_keypoints(self, yx, conf, prev_yx):
+        """Main occlusion handling logic - combines all occlusion strategies.
+        
+        Strategy:
+        1. First, apply side mirroring (mirror visible side to occluded side)
+        2. Then apply kinematic/spatial interpolation for any remaining issues
+        
+        Args:
+            yx: (17,2) array of current keypoint positions
+            conf: (17,) array of confidence scores
+            prev_yx: (17,2) array of previous keypoint positions
+            
+        Returns:
+            (17,2) array of corrected keypoint positions
+        """
+        if not self.occlusion_handling_enabled:
+            return yx
+        
+        # Update occlusion tracking
+        self._update_occlusion_state(conf)
+        self._update_confidence_history(conf)
+        
+        # STEP 1: Apply side mirroring first (for side-view videos)
+        # This mirrors the visible side to the occluded side
+        yx_corrected = self._mirror_visible_side_to_occluded(yx, conf)
+        
+        # Check velocity consistency (using mirrored positions)
+        velocity_inconsistent = self._check_velocity_consistency(yx_corrected, prev_yx)
+        
+        # STEP 2: Apply kinematic/spatial correction for remaining issues
+        for i in range(17):
+            should_correct = False
+            correction_method = None
+            
+            # Determine if keypoint needs additional correction
+            if self._is_occluded(i):
+                should_correct = True
+                correction_method = "occlusion"
+            elif velocity_inconsistent[i] and conf[i] < 0.5:
+                should_correct = True
+                correction_method = "velocity"
+            elif conf[i] < self._occlusion_conf_threshold and self._check_temporal_confidence_consistency(i):
+                should_correct = True
+                correction_method = "low_confidence"
+            
+            if should_correct:
+                # Try kinematic estimation first (more accurate)
+                estimated_pos = self._estimate_occluded_keypoint_kinematic(i, yx_corrected, conf)
+                
+                # Fall back to spatial interpolation
+                if estimated_pos is None:
+                    estimated_pos = self._apply_spatial_interpolation_for_occlusion(i, yx_corrected, conf)
+                
+                # Fall back to previous position if all else fails
+                if estimated_pos is None and prev_yx is not None:
+                    estimated_pos = prev_yx[i]
+                
+                # Apply correction with blending based on confidence
+                if estimated_pos is not None:
+                    # Blend between current and estimated based on confidence
+                    blend_factor = max(0.0, min(1.0, (self._occlusion_conf_threshold - conf[i]) / self._occlusion_conf_threshold))
+                    blend_factor = max(0.7, blend_factor)  # At least 70% correction
+                    
+                    yx_corrected[i] = (1.0 - blend_factor) * yx_corrected[i] + blend_factor * estimated_pos
+        
+        return yx_corrected
+    
+    # ========== END OCCLUSION HANDLING METHODS ==========
+    
     def smooth_keypoints_ema(self, keypoints_with_scores):
         """Enhanced spatio-temporal smoothing with One Euro Filter.
         
@@ -535,6 +942,12 @@ class PoseProcessor:
                     kps[i, 0] = 0.1 * kps[i, 0] + 0.9 * prev[i, 0]
                     kps[i, 1] = 0.1 * kps[i, 1] + 0.9 * prev[i, 1]
 
+        # Apply occlusion handling (corrects occluded keypoints using kinematic constraints)
+        kps_yx = kps[:, 0:2].copy()
+        prev_yx = prev[:, 0:2].copy()
+        kps_yx = self._handle_occluded_keypoints(kps_yx, conf, prev_yx)
+        kps[:, 0:2] = kps_yx
+        
         # Apply outlier guard with updated keypoints
         kps_yx = kps[:, 0:2].copy()
         prev_yx = prev[:, 0:2].copy()
