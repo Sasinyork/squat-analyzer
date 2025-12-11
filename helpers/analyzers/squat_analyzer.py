@@ -31,17 +31,22 @@ class SquatFormAnalyzer:
         self.hip_positions = []  # Store recent hip positions for movement detection
         self.max_history = 10  # Number of frames to track for movement
         self.movement_threshold = 5  # Minimum pixel movement to detect direction
-        self.standing_threshold = -50  # Hip must be this much above knee to be "standing" (negative in image coords)
-        self.bottom_threshold = -50  # Hip must be close to knee level to be "bottom" (more inclusive for depth analysis)
+        self.standing_threshold = -40  # Hip must be this much above knee to be "standing" (negative in image coords)
+        self.bottom_threshold = -50  # Hip must be close to knee level to be "bottom" (relaxed to -30 to account for keypoint tracking inaccuracy at depth)
         self.bottom_deadband = 3  # Stricter deadband for bottom detection (minimal movement required)
         self._bottom_cooldown = 0  # Prevent repeated bottom phase triggers
         self._bottom_cooldown_frames = 8  # Number of frames to wait before allowing bottom again
 
         # Stabilized-bottom detection (for shallow reps that pause before parallel)
-        self.bottom_pause_frames_min = 3  # require N stable/minimal frames while descending
+        self.bottom_pause_frames_min = 2  # require N stable/minimal frames while descending (reduced from 3 to 2 for faster bottom detection)
         self.bottom_pause_counter = 0
-        self.min_descent_drop_ratio = 0.035  # 3.5% of image height descent from start to qualify as a bottom
+        self.min_descent_drop_ratio = 0.03  # 3% of image height descent from start to qualify as a bottom (reduced from 3.5% to be more permissive)
         self._descent_start_hip_y = None
+
+        # Depth achievement tracking - lock in best depth reached during bottom phase
+        self._best_depth_achieved = None  # Track the lowest hip position (highest y value) reached
+        self._depth_locked_in = False  # Once good depth is achieved, lock it in for the rep
+        self._current_rep_depth_status = None  # Track depth status for current rep
 
         # Relaxed top-standing detection (allow settling into standing with imperfect posture)
         self.top_stable_frames_min = 6
@@ -64,16 +69,17 @@ class SquatFormAnalyzer:
 
         # Back rounding sensitivity controls
         # Higher thresholds => less sensitive (require straighter back to trigger)
+        # Lower thresholds allow more forward lean (natural for squats)
         self.back_thresholds = {
-            'side': 135,     # previously 140; slightly less sensitive
-            'front': 145,    # previously 150; slightly less sensitive
-            'angled': 143,   # between side and front
+            'side': 125,     # Allow significant forward lean (natural squat mechanics)
+            'front': 135,    # Front view less affected by forward lean
+            'angled': 130,   # Between side and front
         }
         # Require several consecutive frames below threshold to trigger
-        self.back_consecutive_min = 6   # frames
+        self.back_consecutive_min = 8   # frames - increased for more forgiveness
         self.back_consecutive_counter = 0
         # Light decay so brief good frames don't instantly reset
-        self.back_counter_decay = 2
+        self.back_counter_decay = 3  # Faster decay for more forgiveness
 
         # Keypoint indices for MoveNet
         self.NOSE = 0
@@ -98,6 +104,36 @@ class SquatFormAnalyzer:
             return (x, y)
         return None
     
+    def is_keypoint_at_boundary(self, keypoints, index, boundary_margin=0.02):
+        """Check if a keypoint is at or near the frame boundary (indicating potential clamping).
+        
+        Args:
+            keypoints: The keypoints array
+            index: Keypoint index to check
+            boundary_margin: How close to edge (in normalized coords) to consider "at boundary" (default 2%)
+            
+        Returns:
+            tuple: (at_boundary: bool, which_edge: str or None)
+                   which_edge can be 'left', 'right', 'top', 'bottom', or None
+        """
+        if keypoints[index, 2] < 0.15:  # Low confidence, can't determine
+            return False, None
+        
+        x_norm = keypoints[index, 1]  # Normalized x (0.0 to 1.0)
+        y_norm = keypoints[index, 0]  # Normalized y (0.0 to 1.0)
+        
+        # Check each boundary
+        if x_norm <= boundary_margin:
+            return True, 'left'
+        elif x_norm >= (1.0 - boundary_margin):
+            return True, 'right'
+        elif y_norm <= boundary_margin:
+            return True, 'top'
+        elif y_norm >= (1.0 - boundary_margin):
+            return True, 'bottom'
+        
+        return False, None
+    
     def calculate_angle(self, point1, point2, point3):
         """Calculate angle between three points (point2 is the vertex)."""
         if point1 is None or point2 is None or point3 is None:
@@ -112,6 +148,25 @@ class SquatFormAnalyzer:
         cos_angle = np.clip(cos_angle, -1.0, 1.0)  # Clamp to avoid numerical errors
         angle = np.arccos(cos_angle)
         return np.degrees(angle)
+    
+    def check_critical_keypoints_at_boundary(self, keypoints):
+        """Check if critical keypoints for squat analysis are at frame boundaries.
+        
+        Returns:
+            tuple: (any_at_boundary: bool, boundary_keypoints: list of (index, edge))
+        """
+        critical_indices = [
+            self.LEFT_HIP, self.RIGHT_HIP,
+            self.LEFT_KNEE, self.RIGHT_KNEE,
+        ]
+        
+        boundary_keypoints = []
+        for idx in critical_indices:
+            at_boundary, edge = self.is_keypoint_at_boundary(keypoints, idx)
+            if at_boundary:
+                boundary_keypoints.append((idx, edge))
+        
+        return len(boundary_keypoints) > 0, boundary_keypoints
     
     def is_standing(self, keypoints, image_height, image_width):
         """Check if person is in standing position with proper vertical alignment."""
@@ -181,13 +236,17 @@ class SquatFormAnalyzer:
             return "minimal", avg_movement  # Some movement but not enough to be descending/ascending
     
     def detect_squat_phase(self, keypoints, image_height, image_width):
-        """Detect the current phase of the squat movement with improved logic."""
+        """Detect the current phase of the squat movement with improved logic and boundary detection."""
         left_hip = self.get_keypoint_coords(keypoints, self.LEFT_HIP, image_height, image_width)
         right_hip = self.get_keypoint_coords(keypoints, self.RIGHT_HIP, image_height, image_width)
         left_knee = self.get_keypoint_coords(keypoints, self.LEFT_KNEE, image_height, image_width)
         right_knee = self.get_keypoint_coords(keypoints, self.RIGHT_KNEE, image_height, image_width)
         
         if left_hip and right_hip and left_knee and right_knee:
+            # Check if keypoints are at boundaries (unreliable tracking)
+            at_boundary, boundary_kps = self.check_critical_keypoints_at_boundary(keypoints)
+            hips_at_boundary = any(kp_idx in [self.LEFT_HIP, self.RIGHT_HIP] for kp_idx, _ in boundary_kps)
+            
             hip_y = (left_hip[1] + right_hip[1]) / 2
             knee_y = (left_knee[1] + right_knee[1]) / 2
             hip_knee_diff = hip_y - knee_y
@@ -244,9 +303,23 @@ class SquatFormAnalyzer:
                     # Two ways to bottom:
                     # 1) Reached near/below knee level and stabilized
                     # 2) Paused steadily for N frames with sufficient drop, even if above parallel
-                    reached_knee_level = hip_knee_diff > self.bottom_threshold
+                    
+                    # Adjust allowance based on boundary detection
+                    # If hips are at frame boundary, they're likely clamped - be MUCH more permissive
+                    if hips_at_boundary:
+                        # Add 30 pixels of allowance when at boundary (tracking is unreliable)
+                        boundary_allowance = 30
+                    else:
+                        # Normal 15 pixel allowance
+                        boundary_allowance = 15
+                    
+                    reached_knee_level = hip_knee_diff > (self.bottom_threshold - boundary_allowance)
                     paused_enough = self.bottom_pause_counter >= self.bottom_pause_frames_min
-                    if (movement_direction == "stable" and reached_knee_level) or paused_enough:
+                    
+                    # If at boundary AND descending stopped (stable), assume bottom reached
+                    if hips_at_boundary and movement_direction == "stable":
+                        new_phase = "bottom"
+                    elif (movement_direction == "stable" and reached_knee_level) or paused_enough:
                         new_phase = "bottom"
                     elif movement_direction == "ascending":
                         # Can skip bottom and go straight to ascending if user reverses direction
@@ -305,8 +378,16 @@ class SquatFormAnalyzer:
                     self.bottom_pause_counter = 0
                     if new_phase == "standing":
                         self._standing_frame_counter = 0
+                        # Reset depth tracking for next rep when returning to standing
+                        self._best_depth_achieved = None
+                        self._depth_locked_in = False
+                        self._current_rep_depth_status = None
                 if prev_phase == "standing" and new_phase != "standing":
                     self._standing_frame_counter = 0
+                    # Starting a new rep - reset depth tracking
+                    self._best_depth_achieved = None
+                    self._depth_locked_in = False
+                    self._current_rep_depth_status = None
                 if new_phase == "bottom":
                     # Freeze counters once bottom is reached
                     self.bottom_pause_counter = 0
@@ -486,9 +567,20 @@ class SquatFormAnalyzer:
     
         return issues
     
-    def analyze_depth(self, keypoints, image_height, image_width):
-        """Analyze squat depth only."""
+    def analyze_depth(self, keypoints, image_height, image_width, current_phase=None):
+        """Analyze squat depth only, accounting for keypoints at frame boundaries.
+        
+        Args:
+            keypoints: Keypoint array
+            image_height: Image height in pixels
+            image_width: Image width in pixels
+            current_phase: Current squat phase ('descending', 'bottom', etc.)
+                          Used to determine if depth issue is guidance or form issue
+        """
         issues = []
+        
+        # Check if critical keypoints are at boundaries (unreliable tracking)
+        at_boundary, boundary_kps = self.check_critical_keypoints_at_boundary(keypoints)
         
         left_hip = self.get_keypoint_coords(keypoints, self.LEFT_HIP, image_height, image_width)
         right_hip = self.get_keypoint_coords(keypoints, self.RIGHT_HIP, image_height, image_width)
@@ -501,11 +593,36 @@ class SquatFormAnalyzer:
             knee_center = ((left_knee[0] + right_knee[0]) / 2, 
                            (left_knee[1] + right_knee[1]) / 2)
             
+            # If hips are at horizontal boundaries (left/right edges), tracking may be unreliable
+            # This happens when person squats beyond frame edges
+            hips_at_horizontal_boundary = False
+            for kp_idx, edge in boundary_kps:
+                if kp_idx in [self.LEFT_HIP, self.RIGHT_HIP] and edge in ['left', 'right']:
+                    hips_at_horizontal_boundary = True
+                    break
+            
             # Calculate depth (in image coordinates, y increases downward)
             # depth_ratio < 0: hip above knee (insufficient)
             # depth_ratio ≈ 0: hip aligned with knee (good)
             # depth_ratio > 0: hip below knee (excessive)
             depth_ratio = (hip_center[1] - knee_center[1]) / image_height
+            
+            # Track best depth achieved during bottom/ascending phases
+            # In image coords, higher y = lower position (deeper squat)
+            if current_phase in ['bottom', 'ascending']:
+                # Track the deepest position (highest hip_y value)
+                if self._best_depth_achieved is None or hip_center[1] > self._best_depth_achieved:
+                    self._best_depth_achieved = hip_center[1]
+                
+                # Check if we achieved good depth (hip at or below knee)
+                # Moderately forgiving - allow hip to be slightly above knee
+                good_depth_tolerance = 0.04 * image_height  # 4% tolerance for good depth zone
+                depth_allowance = 0.08 * image_height if hips_at_horizontal_boundary else 0.04 * image_height  # Allowance for hip above knee
+                
+                if hip_center[1] >= knee_center[1] - depth_allowance:
+                    # Good depth achieved! Lock it in for this rep
+                    self._depth_locked_in = True
+                    self._current_rep_depth_status = 'good'
             
             # Analyze depth during bottom phase or when descending and close to knee level
             should_analyze = False
@@ -518,34 +635,83 @@ class SquatFormAnalyzer:
                     should_analyze = True
                 elif self.phase_frames > 10:  # Been descending for more than 10 frames
                     should_analyze = True
+            elif self.squat_phase == "ascending":
+                # During ascending, only show feedback if depth was never locked in
+                # If good depth was achieved, don't penalize on the way up
+                if not self._depth_locked_in:
+                    should_analyze = True
             
             if should_analyze:
-                good_depth_tolerance = 0.05  # 5% of image height tolerance
-                # Allow hip to be slightly above knee (more lenient depth requirement)
-                depth_allowance = 0.02 * image_height  # 2% of image height above knee level
-                # Add threshold for severity: low if just above, medium if much higher
-                if hip_center[1] < knee_center[1] - depth_allowance:
-                    # How far above knee?
-                    above_knee = (knee_center[1] - hip_center[1])
-                    # low severity if within 5% of image height, medium if more
-                    if above_knee <= 0.05 * image_height:
-                        sev = 'low'
-                    else:
-                        sev = 'medium'
-                    issues.append({
-                        'type': 'insufficient_depth',
-                        'severity': sev,
-                        'recommendation': 'Go deeper - hips should be at least parallel with knees'
-                    })
-                # good depth is when hip is aligned with knee level
-                elif abs(hip_center[1] - knee_center[1]) <= good_depth_tolerance * image_height:
-                    # Hip aligned with knee - good depth
-                    # No issues to append
+                # Skip depth analysis during ascending if good depth was already locked in
+                if current_phase == 'ascending' and self._depth_locked_in:
+                    # Depth already achieved, don't penalize on the way up
                     pass
                 else:
-                    # Hip below knee - deep squat (considered good form)
-                    # No issues to append - deep squats are generally better
-                    pass
+                    good_depth_tolerance = 0.10  # 10% of image height tolerance for "good depth" zone
+                    
+                    # Adjust depth allowance based on whether keypoints are at boundaries
+                    if hips_at_horizontal_boundary:
+                        # MUCH more lenient when hips are at frame edge - keypoints likely clamped
+                        # Give 12% of image height allowance since tracking is unreliable
+                        depth_allowance = 0.12 * image_height
+                    else:
+                        # Normal allowance: hip can be up to 6% above knee and still be "good"
+                        depth_allowance = 0.06 * image_height
+                    
+                    # Graduated severity system:
+                    # - Within 4% above knee: GREEN (good depth) - no issue
+                    # - 4-8% above knee: LOW (yellow) - guidance only, rep still counts as correct
+                    # - 8-12% above knee: MEDIUM (orange) - clear issue, rep marked incorrect
+                    # - >12% above knee: HIGH (red) - major issue, way too shallow
+                    if hip_center[1] < knee_center[1] - depth_allowance:
+                        # How far above knee?
+                        above_knee = (knee_center[1] - hip_center[1])
+                        
+                        # If keypoints are at boundary, be conservative with depth feedback
+                        # Only give feedback if significantly above knee (7% of image height)
+                        if hips_at_horizontal_boundary:
+                            if above_knee > 0.07 * image_height:  # 7% threshold when at boundary
+                                # Only count as form issue at bottom, not during descending
+                                is_form_issue = (current_phase == 'bottom')
+                                issues.append({
+                                    'type': 'tracking_limited',
+                                    'severity': 'low',
+                                    'recommendation': 'Move closer to camera center for better tracking',
+                                    'is_form_issue': is_form_issue  # Only affects scoring at bottom
+                                })
+                        else:
+                            # Graduated severity based on how far above knee
+                            # Stricter thresholds for proper depth:
+                            if above_knee <= 0.08 * image_height:  # Within 8% above knee
+                                sev = 'low'  # Yellow - guidance only, doesn't affect rep correctness
+                                message = 'Close to parallel - try going slightly deeper'
+                                # Low severity issues don't count as form issues for rep correctness
+                                is_form_issue = False
+                            elif above_knee <= 0.12 * image_height:  # 8-12% above knee
+                                sev = 'medium'  # Orange - clear issue, affects rep correctness
+                                message = 'Go deeper - hips should be at least parallel with knees'
+                                is_form_issue = (current_phase == 'bottom')
+                            else:  # More than 12% above knee
+                                sev = 'high'  # Red - major issue, way too shallow
+                                message = 'Much too shallow - squat significantly deeper'
+                                is_form_issue = (current_phase == 'bottom')
+                            
+                            issues.append({
+                                'type': 'insufficient_depth',
+                                'severity': sev,
+                                'recommendation': message,
+                                'is_form_issue': is_form_issue  # Only medium/high affect scoring
+                            })
+                    # Good depth zone (within 4% of knee level)
+                    # Hip should be at or just slightly above knee to be considered "good depth"
+                    elif abs(hip_center[1] - knee_center[1]) <= good_depth_tolerance * image_height:
+                        # Hip within good depth tolerance - excellent!
+                        # No issues to append
+                        pass
+                    else:
+                        # Hip below knee - deep squat (considered excellent form)
+                        # No issues to append - deep squats are always better
+                        pass
         
         return issues
     
@@ -603,18 +769,30 @@ class SquatFormAnalyzer:
         if phase == "bottom":
             show_depth_feedback = True
 
-        # Always run analyze_depth/back, but only show depth feedback if show_depth_feedback is True
-        depth_issues = self.analyze_depth(keypoints, image_height, image_width)
+        # Always run analyze_depth/back, pass current phase to analyze_depth
+        depth_issues = self.analyze_depth(keypoints, image_height, image_width, current_phase=phase)
         back_issues = self.analyze_back_form(keypoints, image_height, image_width)
 
-        # If we're descending and have depth issues, show feedback
+        # If we're descending and have depth issues, show feedback (but as guidance, not form issue)
         if phase == "descending" and depth_issues:
             show_depth_feedback = True
 
-        # Merge all detected issues for scoring and recommendations
-        all_issues = []
-        all_issues.extend(depth_issues)
-        all_issues.extend(back_issues)
+        # Separate guidance issues (during descent) from actual form issues (at bottom)
+        # Only form issues affect scoring and rep correctness
+        form_issues = []
+        guidance_issues = []
+        
+        for issue in depth_issues:
+            if issue.get('is_form_issue', True):  # Default to True for backward compatibility
+                form_issues.append(issue)
+            else:
+                guidance_issues.append(issue)
+        
+        # Back issues are always form issues
+        form_issues.extend(back_issues)
+        
+        # All issues for display (includes both form issues and guidance)
+        all_issues = form_issues + guidance_issues
 
 
 
@@ -625,9 +803,9 @@ class SquatFormAnalyzer:
             if len(self._phase_queue) > self._max_phase_queue:
                 self._phase_queue.pop(0)
 
-        # Store issues at bottom phase for rep correctness
+        # Store ONLY form issues at bottom phase for rep correctness (exclude guidance)
         if phase == "bottom":
-            self._last_bottom_issues = all_issues.copy()
+            self._last_bottom_issues = form_issues.copy()  # Only actual form issues, not guidance
 
         # More robust rep detection: allow a single 'stable' or 'unknown' phase in the sequence
         def matches_expected(seq, expected):
@@ -648,25 +826,55 @@ class SquatFormAnalyzer:
             self.rep_count += 1
             # Use issues at bottom for correctness
             is_correct = not any(i.get('severity', 'low') in ('medium', 'high') for i in self._last_bottom_issues)
+            
             if is_correct:
                 self.correct_rep_count += 1
+                print(f"Rep {self.rep_count} - CORRECT (No form issues)")
             else:
                 self.incorrect_rep_count += 1
+                # Log detailed reasons for incorrect rep
+                print(f"Rep {self.rep_count} - INCORRECT")
+                print(f"   Form issues detected at bottom phase:")
+                for issue in self._last_bottom_issues:
+                    severity = issue.get('severity', 'unknown')
+                    issue_type = issue.get('type', 'unknown')
+                    recommendation = issue.get('recommendation', 'N/A')
+                    if severity in ('medium', 'high'):
+                        print(f"   - [{severity.upper()}] {issue_type}: {recommendation}")
+                # Also show lower severity issues for context
+                low_severity_issues = [i for i in self._last_bottom_issues if i.get('severity') == 'low']
+                if low_severity_issues:
+                    print(f"   Additional issues (low severity):")
+                    for issue in low_severity_issues:
+                        issue_type = issue.get('type', 'unknown')
+                        recommendation = issue.get('recommendation', 'N/A')
+                        print(f"   - [LOW] {issue_type}: {recommendation}")
+            
             self._phase_queue = []  # Reset to avoid double-counting
 
         self._last_phase = phase
 
+        # Check if tracking is limited due to boundary clamping
+        at_boundary, boundary_kps = self.check_critical_keypoints_at_boundary(keypoints)
+        tracking_limited = at_boundary and any(
+            kp_idx in [self.LEFT_HIP, self.RIGHT_HIP, self.LEFT_KNEE, self.RIGHT_KNEE] 
+            for kp_idx, _ in boundary_kps
+        )
+
         feedback = {
             'phase': phase,
             'phase_frames': self.phase_frames,
-            'issues': all_issues,
+            'issues': all_issues,  # All issues for display (form + guidance)
+            'form_issues': form_issues,  # Only issues that affect scoring
+            'guidance_issues': guidance_issues,  # Guidance only (e.g., depth during descent)
             'depth_metric': depth_metric,
-            'overall_score': self.calculate_form_score(all_issues),
-            'primary_issue': self.get_primary_issue(all_issues),
-            'recommendations': self.get_recommendations(all_issues),
+            'overall_score': self.calculate_form_score(form_issues),  # Score based on form issues only
+            'primary_issue': self.get_primary_issue(form_issues),  # Primary form issue only
+            'recommendations': self.get_recommendations(all_issues),  # Show all recommendations
             'rep_count': self.rep_count,
             'correct_rep_count': self.correct_rep_count,
-            'incorrect_rep_count': self.incorrect_rep_count
+            'incorrect_rep_count': self.incorrect_rep_count,
+            'tracking_limited': tracking_limited  # Flag for UI to show tracking warning
         }
 
         # If we settled into standing via relaxed criteria, surface a gentle posture cue
@@ -685,9 +893,15 @@ class SquatFormAnalyzer:
                 # Add recommendation for good depth
                 feedback['recommendations'] = ['Great! Knee level is the minimum, but going deeper is even better - especially for building strength and muscle.']
             else:
-                feedback['depth_status'] = 'needs_improvement'
-                # Use the first recommendation for depth issues, or a generic message
-                feedback['depth_message'] = depth_issues[0]['recommendation'] if 'recommendation' in depth_issues[0] else 'Needs improvement'
+                # During descending: show as guidance (not a form issue yet)
+                # At bottom: show as form issue
+                if phase == 'descending':
+                    feedback['depth_status'] = 'guidance'  # Just guidance, not an issue
+                    feedback['depth_message'] = 'Keep going - aim for hips parallel with knees'
+                else:  # At bottom
+                    feedback['depth_status'] = 'needs_improvement'
+                    # Use the first recommendation for depth issues, or a generic message
+                    feedback['depth_message'] = depth_issues[0]['recommendation'] if 'recommendation' in depth_issues[0] else 'Needs improvement'
         else:
             feedback['depth_status'] = None
             feedback['depth_message'] = None

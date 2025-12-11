@@ -613,9 +613,11 @@ def draw_comprehensive_feedback_overlay(image, feedback):
                     depth_color = _severity_to_color(depth_sev)
                 else:
                     if form_analysis['depth_status'] == 'good':
-                        depth_color = (90, 170, 90)
+                        depth_color = (90, 170, 90)  # Green for good depth
                     elif form_analysis['depth_status'] == 'needs_improvement':
-                        depth_color = (60, 160, 255)
+                        depth_color = (60, 160, 255)  # Orange for form issue
+                    elif form_analysis['depth_status'] == 'guidance':
+                        depth_color = (180, 200, 255)  # Light blue for guidance (not a form issue)
                     else:
                         depth_color = (220, 220, 220)
                 wrapped = wrap_text(form_analysis['depth_message'], font, font_scale_secondary, thickness_secondary, max_text_width)
