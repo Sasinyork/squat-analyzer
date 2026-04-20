@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import math
+import json
+import os
 
 class SquatFormAnalyzer:
     """Analyzes squat form and provides feedback on common issues."""
@@ -67,19 +69,46 @@ class SquatFormAnalyzer:
         self.top_lean_grace_frames = 8  # don't check immediately after reaching standing
         self.top_lean_min_offset_ratio = 0.02  # require at least 2% of image width horizontal torso offset
 
+        # Load expert baselines if available
+        self.expert_baselines = self._load_expert_baselines()
+        
         # Back rounding sensitivity controls
         # Higher thresholds => less sensitive (require straighter back to trigger)
         # Lower thresholds allow more forward lean (natural for squats)
-        self.back_thresholds = {
-            'side': 125,     # Allow significant forward lean (natural squat mechanics)
-            'front': 135,    # Front view less affected by forward lean
-            'angled': 130,   # Between side and front
-        }
+        if self.expert_baselines and 'back_angle' in self.expert_baselines:
+            # Use expert-derived threshold (mean - 1 std from expert data)
+            expert_threshold = self.expert_baselines['back_angle']['recommended_threshold']
+            self.back_thresholds = {
+                'side': expert_threshold,
+                'front': expert_threshold + 10,  # Front view typically has higher angles
+                'angled': expert_threshold + 5,
+            }
+            print(f"[SquatAnalyzer] Using expert-derived back angle thresholds: {expert_threshold:.1f}°")
+        else:
+            # Fallback to original hardcoded values
+            self.back_thresholds = {
+                'side': 125,     # Allow significant forward lean (natural squat mechanics)
+                'front': 135,    # Front view less affected by forward lean
+                'angled': 130,   # Between side and front
+            }
         # Require several consecutive frames below threshold to trigger
         self.back_consecutive_min = 8   # frames - increased for more forgiveness
         self.back_consecutive_counter = 0
         # Light decay so brief good frames don't instantly reset
         self.back_counter_decay = 3  # Faster decay for more forgiveness
+        
+        # Store expert depth allowance for use in analyze_depth
+        if self.expert_baselines and 'hip_knee_depth_ratio' in self.expert_baselines:
+            # Expert data shows how deep experts go (negative = below knee)
+            # But for minimum standard, we want to be STRICTER than "mean - 1 std"
+            # Cap the allowance at 4% of image height (hip slightly above knee is max acceptable)
+            expert_allowance = abs(self.expert_baselines['hip_knee_depth_ratio']['recommended_allowance'])
+            self.expert_depth_allowance_ratio = min(expert_allowance, 0.04)  # Cap at 4%
+            print(f"[SquatAnalyzer] Expert depth data: {expert_allowance:.4f} ({expert_allowance*100:.1f}%)")
+            print(f"[SquatAnalyzer] Using capped depth allowance: {self.expert_depth_allowance_ratio:.4f} ({self.expert_depth_allowance_ratio*100:.1f}% of image height)")
+            print(f"[SquatAnalyzer]   -> Hip must be within 4% above knee to pass depth check")
+        else:
+            self.expert_depth_allowance_ratio = 0.04  # Default: 4% allowance
 
         # Keypoint indices for MoveNet
         self.NOSE = 0
@@ -95,6 +124,36 @@ class SquatFormAnalyzer:
         self.RIGHT_KNEE = 14
         self.LEFT_ANKLE = 15
         self.RIGHT_ANKLE = 16
+    
+    def _load_expert_baselines(self, baseline_file='expert_baselines.json'):
+        """Load expert-derived baselines from JSON file.
+        
+        Args:
+            baseline_file: Path to the expert baselines JSON file (default: 'expert_baselines.json')
+            
+        Returns:
+            dict: Expert baselines data, or None if file not found
+        """
+        try:
+            # Try to load from project root
+            if os.path.exists(baseline_file):
+                with open(baseline_file, 'r') as f:
+                    baselines = json.load(f)
+                print(f"[SquatAnalyzer] Loaded expert baselines from {baseline_file}")
+                return baselines
+            # Try to load from script directory
+            script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            baseline_path = os.path.join(script_dir, baseline_file)
+            if os.path.exists(baseline_path):
+                with open(baseline_path, 'r') as f:
+                    baselines = json.load(f)
+                print(f"[SquatAnalyzer] Loaded expert baselines from {baseline_path}")
+                return baselines
+        except Exception as e:
+            print(f"[SquatAnalyzer] Could not load expert baselines: {e}")
+        
+        print(f"[SquatAnalyzer] No expert baselines found, using default thresholds")
+        return None
         
     def get_keypoint_coords(self, keypoints, index, image_height, image_width):
         """Get pixel coordinates for a keypoint."""
@@ -649,14 +708,23 @@ class SquatFormAnalyzer:
                 else:
                     good_depth_tolerance = 0.10  # 10% of image height tolerance for "good depth" zone
                     
+                    # Use expert-derived depth allowance if available, otherwise use defaults
+                    # Expert data is used to inform but we cap at 4% to maintain parallel standard
+                    if self.expert_depth_allowance_ratio is not None:
+                        # Use expert-derived allowance (capped at 4%)
+                        base_depth_allowance = self.expert_depth_allowance_ratio * image_height
+                    else:
+                        # Fallback to strict 4% value
+                        base_depth_allowance = 0.04 * image_height
+                    
                     # Adjust depth allowance based on whether keypoints are at boundaries
                     if hips_at_horizontal_boundary:
-                        # MUCH more lenient when hips are at frame edge - keypoints likely clamped
-                        # Give 12% of image height allowance since tracking is unreliable
-                        depth_allowance = 0.12 * image_height
+                        # More lenient when hips are at frame edge - keypoints likely clamped
+                        # Add 8% extra allowance (total ~12%) since tracking is unreliable
+                        depth_allowance = base_depth_allowance + (0.08 * image_height)
                     else:
-                        # Normal allowance: hip can be up to 6% above knee and still be "good"
-                        depth_allowance = 0.06 * image_height
+                        # Normal strict allowance: hip must be near parallel
+                        depth_allowance = base_depth_allowance
                     
                     # Graduated severity system:
                     # - Within 4% above knee: GREEN (good depth) - no issue

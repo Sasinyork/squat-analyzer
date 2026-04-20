@@ -565,42 +565,110 @@ def compare_on_video(video_path, show_live=True, output_path=None):
     print("="*60)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python compare_smoothing.py <video_path> [--no-live] [--output <output_path>]")
-        print("\nExample:")
-        print("  python compare_smoothing.py data/squat/squat_video.mp4")
-        print("  python compare_smoothing.py data/squat/squat_video.mp4 --no-live")
-        print("  python compare_smoothing.py data/squat/squat_video.mp4 --output output/comparison.mp4")
-        print("\nOptions:")
-        print("  --no-live    Disable live video display (faster processing)")
-        print("  --output     Save comparison video to specified path")
-        sys.exit(1)
+def get_user_choices():
+    """Get user choices for video and output saving (squat mode auto-selected)."""
+    import os
     
-    video_path = sys.argv[1]
-    show_live = "--no-live" not in sys.argv
+    # Automatically set to squat mode
+    print("\n=== Squat Mode (Auto-selected) ===")
     
-    # Parse output path
-    output_path = None
-    if "--output" in sys.argv:
+    # Choose video from squat directory
+    print("\n=== Squat Video Selection ===")
+    
+    videos = []
+    squat_dir = "data/squat"
+    if os.path.exists(squat_dir):
+        for file in os.listdir(squat_dir):
+            if file.endswith('.mp4'):
+                videos.append(os.path.join(squat_dir, file))
+    
+    if not videos:
+        print("No squat videos found in data/squat directory!")
+        return None, None
+    
+    # Display video options
+    for i, video in enumerate(videos, 1):
+        print(f"{i}. {os.path.basename(video)}")
+    
+    while True:
         try:
-            output_idx = sys.argv.index("--output")
-            if output_idx + 1 < len(sys.argv):
-                output_path = sys.argv[output_idx + 1]
-                # Create output directory if it doesn't exist
-                import os
-                output_dir = os.path.dirname(output_path)
-                if output_dir and not os.path.exists(output_dir):
-                    os.makedirs(output_dir)
-                # Auto-increment filename if it exists
-                if os.path.exists(output_path):
-                    base, ext = os.path.splitext(output_path)
-                    idx = 1
-                    while os.path.exists(f"{base}_{idx}{ext}"):
-                        idx += 1
-                    output_path = f"{base}_{idx}{ext}"
-        except (ValueError, IndexError):
-            print("Error: --output requires a file path")
+            choice = int(input(f"Choose video (1-{len(videos)}): ").strip())
+            if 1 <= choice <= len(videos):
+                video_path = videos[choice - 1]
+                break
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {len(videos)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+    
+    # Ask about saving output
+    print("\n=== Output Options ===")
+    while True:
+        save_choice = input("Do you want to save the comparison video? (y/n): ").strip().lower()
+        if save_choice in ['y', 'yes']:
+            # Generate output filename
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            output_base = f"output/{base_name}_comparison"
+            ext = ".mp4"
+            output_path = output_base + ext
+            os.makedirs("output", exist_ok=True)
+            idx = 1
+            while os.path.exists(output_path):
+                output_path = f"{output_base}_{idx}{ext}"
+                idx += 1
+            break
+        elif save_choice in ['n', 'no']:
+            output_path = None
+            break
+        else:
+            print("Invalid choice. Please enter 'y' or 'n'.")
+    
+    return video_path, output_path
+
+
+if __name__ == "__main__":
+    # Check if command line arguments are provided (for backward compatibility)
+    if len(sys.argv) > 1 and not sys.argv[1].startswith('-'):
+        # Use command line arguments
+        video_path = sys.argv[1]
+        show_live = "--no-live" not in sys.argv
+        
+        # Parse output path
+        output_path = None
+        if "--output" in sys.argv:
+            try:
+                output_idx = sys.argv.index("--output")
+                if output_idx + 1 < len(sys.argv):
+                    output_path = sys.argv[output_idx + 1]
+                    # Create output directory if it doesn't exist
+                    import os
+                    output_dir = os.path.dirname(output_path)
+                    if output_dir and not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+                    # Auto-increment filename if it exists
+                    if os.path.exists(output_path):
+                        base, ext = os.path.splitext(output_path)
+                        idx = 1
+                        while os.path.exists(f"{base}_{idx}{ext}"):
+                            idx += 1
+                        output_path = f"{base}_{idx}{ext}"
+            except (ValueError, IndexError):
+                print("Error: --output requires a file path")
+                sys.exit(1)
+    else:
+        # Interactive mode
+        result = get_user_choices()
+        if result[0] is None:  # No videos found
             sys.exit(1)
+        
+        video_path, output_path = result
+        show_live = True  # Default to showing live display in interactive mode
+    
+    print(f"\n=== Configuration ===")
+    print(f"Video: {video_path}")
+    print(f"Mode: Squat (Auto-selected)")
+    print(f"Display: {'Live view enabled' if show_live else 'No live view'}")
+    print(f"Output: {output_path if output_path else 'Display only'}")
+    print("")
     
     compare_on_video(video_path, show_live=show_live, output_path=output_path)

@@ -96,7 +96,8 @@ def run_live_camera_squat(save_output=False):
                             print(f"Calculated actual FPS: {calculated_fps:.2f}")
                             
                             # Initialize video writer with calculated FPS
-                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                            # Use H.264 codec for better quality (avc1 for macOS)
+                            fourcc = cv2.VideoWriter_fourcc(*'avc1')
                             out = cv2.VideoWriter(output_path, fourcc, calculated_fps, 
                                                 (actual_width, actual_height))
                             print(f"Recording to: {output_path}")
