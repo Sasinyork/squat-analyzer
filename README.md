@@ -49,7 +49,7 @@ A real-time pose detection and form analysis app powered by Google's MoveNet Lig
 1. **Clone the repository**:
 
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/Sasinyork/squat-analyzer.git
    cd movenet-lightning
    ```
 
